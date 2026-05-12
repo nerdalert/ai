@@ -41,7 +41,6 @@ impl FilterPipeline {
         let mut idx = 0;
         while idx < self.filters.len() {
             let pf = &self.filters[idx];
-
             match run_request_filter(pf, ctx).await? {
                 RequestFilterResult::Skip => {
                     idx += 1;
@@ -50,14 +49,15 @@ impl FilterPipeline {
                 RequestFilterResult::Reject(r) => return Ok(FilterAction::Reject(r)),
                 RequestFilterResult::Continue => {},
             }
-
             ctx.executed_filter_indices[idx] = true;
-
-            let branch_outcome = super::evaluate::evaluate_branches(&pf.branches, ctx).await?;
-            match branch_outcome {
+            match super::evaluate::evaluate_branches(&pf.branches, ctx).await? {
                 BranchOutcome::Continue => idx += 1,
                 BranchOutcome::Terminal => return Ok(FilterAction::Continue),
-                BranchOutcome::SkipTo(t) | BranchOutcome::ReEnter(t) => idx = t,
+                BranchOutcome::SkipTo(t) => idx = t,
+                BranchOutcome::ReEnter(t) => {
+                    ctx.executed_filter_indices[t..=idx].fill(false);
+                    idx = t;
+                },
                 BranchOutcome::Reject(r) => return Ok(FilterAction::Reject(r)),
             }
         }

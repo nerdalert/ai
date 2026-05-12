@@ -5,7 +5,7 @@
 
 use std::{future::Future, pin::Pin, sync::Arc};
 
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use super::{
     branch::{BranchOutcome, RejoinTarget, ResolvedBranch},
@@ -136,14 +136,14 @@ async fn dispatch_nested_outcome(
     match outcome {
         BranchOutcome::Continue => Ok(None),
         BranchOutcome::SkipTo(target) => {
-            debug!(
+            warn!(
                 target,
                 "discarding SkipTo from nested branch; nested control flow does not propagate"
             );
             Ok(None)
         },
         BranchOutcome::ReEnter(target) => {
-            debug!(
+            warn!(
                 target,
                 "discarding ReEnter from nested branch; nested control flow does not propagate"
             );

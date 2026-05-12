@@ -6,7 +6,7 @@
 use std::{collections::HashMap, mem, sync::Arc};
 
 use praxis_core::config::FilterEntry;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::{FilterPipeline, body::compute_body_capabilities, filter::PipelineFilter};
 use crate::{FilterError, any_filter::AnyFilter, registry::FilterRegistry};
@@ -28,6 +28,7 @@ impl FilterPipeline {
         let mut filters = Vec::with_capacity(entries.len());
         for entry in entries.iter_mut() {
             let filter = registry.create(&entry.filter_type, &entry.config)?;
+            warn_tcp_unsupported_fields(&filter, entry);
             let has_conditions = !entry.conditions.is_empty() || !entry.response_conditions.is_empty();
             debug!(
                 filter = filter.name(),
@@ -175,6 +176,31 @@ impl FilterPipeline {
 // -----------------------------------------------------------------------------
 // Utility Functions
 // -----------------------------------------------------------------------------
+
+/// Warn when a TCP filter has conditions or branch chains configured.
+///
+/// TCP filters do not support conditions or branching; these fields
+/// are silently ignored at runtime. Logging at build time helps
+/// operators catch misconfigurations.
+fn warn_tcp_unsupported_fields(filter: &AnyFilter, entry: &FilterEntry) {
+    if !matches!(filter, AnyFilter::Tcp(_)) {
+        return;
+    }
+    if !entry.conditions.is_empty() || !entry.response_conditions.is_empty() {
+        warn!(
+            filter = filter.name(),
+            "TCP filter has conditions that will be ignored; \
+             conditions are only evaluated for HTTP filters"
+        );
+    }
+    if entry.branch_chains.is_some() {
+        warn!(
+            filter = filter.name(),
+            "TCP filter has branch_chains that will be ignored; \
+             branching is only supported for HTTP filters"
+        );
+    }
+}
 
 /// Scan the filter list for a compression filter and extract its config.
 fn extract_compression_config(

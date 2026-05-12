@@ -154,7 +154,8 @@ fn register_http(
     name: &str,
     factory_fn: fn(&serde_yaml::Value) -> Result<Box<dyn crate::filter::HttpFilter>, FilterError>,
 ) {
-    factories.insert(name.to_owned(), http_builtin(factory_fn));
+    let prev = factories.insert(name.to_owned(), http_builtin(factory_fn));
+    debug_assert!(prev.is_none(), "duplicate built-in HTTP filter name: '{name}'");
 }
 
 /// Register all built-in TCP filter factories.
@@ -179,7 +180,8 @@ fn register_tcp(
     name: &str,
     factory_fn: fn(&serde_yaml::Value) -> Result<Box<dyn crate::tcp_filter::TcpFilter>, FilterError>,
 ) {
-    factories.insert(name.to_owned(), tcp_builtin(factory_fn));
+    let prev = factories.insert(name.to_owned(), tcp_builtin(factory_fn));
+    debug_assert!(prev.is_none(), "duplicate built-in TCP filter name: '{name}'");
 }
 
 // -----------------------------------------------------------------------------
