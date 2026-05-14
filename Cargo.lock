@@ -294,7 +294,7 @@ checksum = "3a8241f3ebb85c056b509d4327ad0358fbbba6ffb340bf388f26350aeda225b1"
 
 [[package]]
 name = "benchmarks"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "chrono",
  "criterion",
@@ -772,7 +772,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1344,9 +1344,9 @@ dependencies = [
 
 [[package]]
 name = "kqueue-sys"
-version = "1.1.1"
+version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "285efcf12ef41bec907b3000d5ffaeb54191d4d9d83c0d6157e6cbc2db255e64"
+checksum = "07293a4e297ac234359b510362495713f75ea345d5307140414f20c69ffeb087"
 dependencies = [
  "bitflags 2.11.1",
  "libc",
@@ -1638,7 +1638,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2098,7 +2098,7 @@ dependencies = [
 
 [[package]]
 name = "praxis"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "clap",
  "nix",
@@ -2117,7 +2117,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-proxy-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "dashmap",
  "pingora-core",
@@ -2132,7 +2132,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-proxy-filter"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2154,7 +2154,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-proxy-proto"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "prost",
  "prost-build",
@@ -2168,7 +2168,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-proxy-protocol"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -2195,7 +2195,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-proxy-tls"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "arc-swap",
  "notify",
@@ -2213,7 +2213,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-test-utils"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -2238,7 +2238,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-tests-conformance"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "h2",
  "http",
@@ -2251,7 +2251,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-tests-integration"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -2275,7 +2275,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-tests-resilience"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "async-trait",
  "benchmarks",
@@ -2291,7 +2291,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-tests-schema"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2306,7 +2306,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-tests-security"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "praxis-proxy-core",
  "praxis-proxy-filter",
@@ -2316,7 +2316,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-tests-smoke"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "praxis",
  "praxis-proxy-core",
@@ -2778,7 +2778,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3137,7 +3137,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3782,7 +3782,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4054,7 +4054,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "benchmarks",
  "chrono",
