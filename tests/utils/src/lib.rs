@@ -14,10 +14,12 @@
 
 //! Shared test utilities for the Praxis workspace.
 
+pub mod agentic;
 pub mod example_config;
 pub mod net;
 pub mod proxy;
 
+pub use agentic::*;
 pub use example_config::{example_config_path, load_example_config, patch_yaml};
 pub use net::*;
 pub use proxy::{

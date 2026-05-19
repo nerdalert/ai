@@ -35,6 +35,7 @@
 )]
 
 mod adversarial;
+mod agentic_mocks;
 mod body;
 mod body_pipeline;
 mod compression;
