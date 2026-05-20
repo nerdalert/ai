@@ -54,10 +54,9 @@ jobs:
           save-always: true
 
       - name: Install benchmark tools
-        run: make tools
-
-      - name: Build container image
-        run: make container
+        run: |
+          make tools
+          echo "${{ github.workspace }}/target/praxis-binutils" >> "$GITHUB_PATH"
 
       - name: Download baseline
         id: baseline
@@ -80,6 +79,7 @@ jobs:
 
           gh api "repos/${{ github.repository }}/actions/artifacts/${artifact_id}/zip" > baseline.zip
           unzip -o baseline.zip -d .
+          mv benchmark-results.yaml baseline.yaml
           echo "status=ok" >> "$GITHUB_OUTPUT"
 
       - name: Run benchmarks
@@ -112,6 +112,7 @@ jobs:
           overwrite: true
 
       - name: Upload timestamped results
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: benchmark-${{ github.sha }}
