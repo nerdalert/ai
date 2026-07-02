@@ -70,6 +70,7 @@ use self::{
 /// headers:
 ///   method: x-praxis-a2a-method
 ///   family: x-praxis-a2a-family
+///   context_id: x-praxis-a2a-context-id
 ///   task_id: x-praxis-a2a-task-id
 ///   kind: x-praxis-a2a-kind
 ///   streaming: x-praxis-a2a-streaming

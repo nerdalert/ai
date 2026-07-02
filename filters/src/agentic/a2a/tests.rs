@@ -510,6 +510,19 @@ fn send_message_context_id_extracted_from_message() {
 }
 
 #[test]
+fn send_message_without_context_id_leaves_context_unset() {
+    let json = serde_json::json!({
+        "jsonrpc": "2.0", "method": "SendMessage",
+        "params": { "message": { "role": "ROLE_USER", "parts": [] } }, "id": 1
+    });
+    let envelope = extract_a2a_envelope(&json, "SendMessage", &BTreeMap::new(), &HeaderMap::new());
+    assert_eq!(
+        envelope.context_id, None,
+        "missing params.message.contextId should leave context_id unset"
+    );
+}
+
+#[test]
 fn send_streaming_message_context_id_extracted_from_message() {
     let json = serde_json::json!({
         "jsonrpc": "2.0", "method": "SendStreamingMessage",
@@ -551,8 +564,30 @@ fn non_string_context_id_left_unset() {
 }
 
 #[test]
+fn list_tasks_non_string_context_id_left_unset() {
+    let json = serde_json::json!({
+        "jsonrpc": "2.0", "method": "ListTasks",
+        "params": { "contextId": 42 }, "id": 1
+    });
+    let envelope = extract_a2a_envelope(&json, "ListTasks", &BTreeMap::new(), &HeaderMap::new());
+    assert_eq!(
+        envelope.context_id, None,
+        "non-string params.contextId should leave context_id unset"
+    );
+}
+
+#[test]
 fn methods_without_context_id_do_not_extract_context() {
-    for method in ["GetTask", "CancelTask", "SubscribeToTask", "GetExtendedAgentCard"] {
+    for method in [
+        "GetTask",
+        "CancelTask",
+        "SubscribeToTask",
+        "CreateTaskPushNotificationConfig",
+        "GetTaskPushNotificationConfig",
+        "ListTaskPushNotificationConfigs",
+        "DeleteTaskPushNotificationConfig",
+        "GetExtendedAgentCard",
+    ] {
         let json = serde_json::json!({
             "jsonrpc": "2.0", "method": method,
             "params": { "id": "task-1", "contextId": "ctx-should-not-extract" }, "id": 1
