@@ -69,6 +69,7 @@ fn build_config(args: &Args) -> Config {
             filters: vec![entry],
         }],
         insecure_options: InsecureOptions::default(),
+        metrics: praxis_core::config::MetricsConfig::default(),
         listeners: vec![echo_listener(&args.address)],
         runtime: RuntimeConfig::default(),
         shutdown_timeout_secs: 30,

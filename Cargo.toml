@@ -4,7 +4,9 @@ members = [
     "server",
     "filters",
     "apis",
+    "integrations/llmd/ext-proc",
     "xtask",
+    "tests/environment",
     "tests/integration",
     "tests/schema",
     "tests/utils",
@@ -54,15 +56,31 @@ tokio-util = "0.7.18"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 wiremock = "0.6.5"
+prost = "0.14.4"
+prost-build = "0.14.4"
+prost-types = "0.14.4"
+prost-wkt-types = { version = "0.7.1", features = ["vendored-protox"] }
+protox = "0.9.1"
+sync_wrapper = "1.0.2"
+tonic = "0.14.6"
+tonic-prost = "0.14.6"
+tonic-prost-build = { version = "0.14.6", features = ["transport"] }
+tokio-stream = "0.1.18"
 zeroize = "1.9.0"
 
 # Praxis core dependencies
-praxis-core = { version = "0.4.0", package = "praxis-proxy-core" }
-praxis-filter = { version = "0.4.0", package = "praxis-proxy-filter" }
-praxis-protocol = { version = "0.4.0", package = "praxis-proxy-protocol" }
-praxis-tls = { version = "0.4.0", package = "praxis-proxy-tls" }
-praxis = { version = "0.4.0", package = "praxis-proxy" }
+# Temporary git pin until the next Praxis release includes the ext_proc
+# support APIs (TrustedHeaderMutation, pre_read_mutations,
+# set_structured_metadata, MetricsConfig) needed by llm-d environment tests.
+praxis-core = { git = "https://github.com/praxis-proxy/praxis.git", rev = "546871d8fdb85a6b0260e77ee4a63083c1c097fb", package = "praxis-proxy-core" }
+praxis-filter = { git = "https://github.com/praxis-proxy/praxis.git", rev = "546871d8fdb85a6b0260e77ee4a63083c1c097fb", package = "praxis-proxy-filter" }
+praxis-protocol = { git = "https://github.com/praxis-proxy/praxis.git", rev = "546871d8fdb85a6b0260e77ee4a63083c1c097fb", package = "praxis-proxy-protocol" }
+praxis-tls = { git = "https://github.com/praxis-proxy/praxis.git", rev = "546871d8fdb85a6b0260e77ee4a63083c1c097fb", package = "praxis-proxy-tls" }
+praxis = { git = "https://github.com/praxis-proxy/praxis.git", rev = "546871d8fdb85a6b0260e77ee4a63083c1c097fb", package = "praxis-proxy" }
 praxis-test-utils = { path = "tests/utils" }
+
+# AI-owned llm-d ext_proc compatibility layer
+praxis-ai-llmd-ext-proc = { version = "0.1.0", path = "integrations/llmd/ext-proc" }
 
 # Praxis AI workspace dependencies
 praxis-ai-proxy = { version = "0.1.0", path = "server" }

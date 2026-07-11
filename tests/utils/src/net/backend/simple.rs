@@ -411,6 +411,7 @@ fn build_config(address: &str, clusters: Vec<Cluster>, filters: Vec<FilterEntry>
             filters,
         }],
         insecure_options: InsecureOptions::default(),
+        metrics: praxis_core::config::MetricsConfig::default(),
         listeners: vec![Listener {
             address: address.to_owned(),
             cluster: None,

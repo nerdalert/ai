@@ -35,4 +35,8 @@ highlight = "all"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
+# Temporary: pinned until the next Praxis release includes the
+# support APIs (TrustedHeaderMutation, pre_read_mutations,
+# set_structured_metadata, MetricsConfig) needed by the
+# llm-d ext_proc compatibility layer.
+allow-git = ["https://github.com/praxis-proxy/praxis.git"]
