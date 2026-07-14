@@ -940,6 +940,7 @@ fn build_json_rpc_config(max_body_bytes: usize) -> JsonRpcConfig {
         JsonRpcConfig {
             batch_policy: BatchPolicy::Reject,
             headers,
+            max_batch_size: 100,
             max_body_bytes,
             on_invalid: OnInvalidBehavior::Continue,
         }

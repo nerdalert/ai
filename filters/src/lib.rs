@@ -10,6 +10,7 @@
 //! header injection.
 
 pub mod agentic;
+pub mod grid;
 pub mod guardrails;
 pub mod inference;
 pub mod prompt_enrich;
@@ -17,6 +18,7 @@ mod token_count;
 mod token_usage_headers;
 
 pub use agentic::{a2a::A2aFilter, mcp::McpFilter};
+pub use grid::GridRouteFilter;
 pub use guardrails::AiGuardrailsFilter;
 pub use inference::ModelToHeaderFilter;
 pub use prompt_enrich::PromptEnrichFilter;
@@ -86,11 +88,8 @@ pub(crate) mod test_utils {
             selected_endpoint_index: None,
             time_source: &praxis_core::time::SystemTimeSource,
             upstream: None,
-            #[cfg(feature = "praxis-main")]
             peer_identity: None,
-            #[cfg(feature = "praxis-main")]
             pre_read_mutations: Vec::new(),
-            #[cfg(feature = "praxis-main")]
             structured_metadata: std::collections::HashMap::new(),
         }
     }
