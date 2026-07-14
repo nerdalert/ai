@@ -7,8 +7,8 @@ use praxis_core::subrequest::SubRequestClient;
 use praxis_filter::FilterRegistry;
 
 use crate::{
-    A2aFilter, AiGuardrailsFilter, McpFilter, ModelToHeaderFilter, PromptEnrichFilter, TimeToFirstTokenFilter,
-    TokenCountFilter, TokenUsageHeadersFilter,
+    A2aFilter, AiGuardrailsFilter, GridRouteFilter, McpFilter, ModelToHeaderFilter, PromptEnrichFilter,
+    TimeToFirstTokenFilter, TokenCountFilter, TokenUsageHeadersFilter,
 };
 
 /// Register all in-tree AI HTTP filters into `registry`.
@@ -32,6 +32,7 @@ pub fn register_ai_filters(registry: &mut FilterRegistry, subrequest_client: Opt
     register_general_ai_filters(registry);
     register_anthropic_filters(registry);
     register_openai_filters(registry, subrequest_client);
+    register_grid_filters(registry);
 }
 
 /// Build a [`FilterRegistry`] with core builtins and in-tree AI filters.
@@ -90,6 +91,14 @@ fn register_general_ai_filters(registry: &mut FilterRegistry) {
     praxis_filter::register_filters!(
         @register registry,
         http "time_to_first_token" => TimeToFirstTokenFilter::from_config
+    );
+}
+
+/// Register Grid gateway-to-gateway routing filters.
+fn register_grid_filters(registry: &mut FilterRegistry) {
+    praxis_filter::register_filters!(
+        @register registry,
+        http "grid_route" => GridRouteFilter::from_config
     );
 }
 
@@ -256,6 +265,7 @@ mod tests {
             "expected openai_responses_validate in registry"
         );
         assert!(names.contains(&"a2a"), "expected agentic filter a2a in registry");
+        assert!(names.contains(&"grid_route"), "expected grid_route in registry");
         assert!(
             names.contains(&"anthropic_validate"),
             "expected anthropic filter in registry"
