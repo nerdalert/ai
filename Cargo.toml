@@ -69,9 +69,9 @@ tokio-stream = "0.1.18"
 zeroize = "1.9.0"
 
 # Praxis core dependencies
-# Temporary git pin until the next Praxis release includes the ext_proc
-# support APIs (TrustedHeaderMutation, pre_read_mutations,
-# set_structured_metadata, MetricsConfig) needed by llm-d environment tests.
+# Temporary pin: 546871d has ext_proc support APIs needed by llm-d integration.
+# grid_route (from #339) also compiles against this pin; it uses only selects_cluster(),
+# get_metadata/set_metadata, and cluster — all available at 546871d.
 praxis-core = { git = "https://github.com/praxis-proxy/praxis.git", rev = "546871d8fdb85a6b0260e77ee4a63083c1c097fb", package = "praxis-proxy-core" }
 praxis-filter = { git = "https://github.com/praxis-proxy/praxis.git", rev = "546871d8fdb85a6b0260e77ee4a63083c1c097fb", package = "praxis-proxy-filter" }
 praxis-protocol = { git = "https://github.com/praxis-proxy/praxis.git", rev = "546871d8fdb85a6b0260e77ee4a63083c1c097fb", package = "praxis-proxy-protocol" }
