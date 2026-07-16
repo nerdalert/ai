@@ -173,6 +173,7 @@ impl HttpFilter for GridRouteFilter {
                 site = &*c.site,
                 cluster = &*c.cluster,
                 fresh = c.fresh,
+                has_credential = c.credential.is_some(),
                 score = score_candidate(c, &self.local_site),
                 "grid_route: selected"
             );
@@ -312,12 +313,25 @@ fn score_candidate(candidate: &RouteCandidate, local_site: &str) -> i32 {
 /// Keys use `grid.route.` namespace. All values are bounded by the
 /// existing `set_metadata` limits.  No HTTP forwarding headers are
 /// written by this function.
+///
+/// When the selected candidate carries a credential reference, four
+/// additional keys are written under `grid.route.credential.*`.  These
+/// hold only the Kubernetes Secret locating information — never the
+/// token value — so that a downstream `grid_credential_inject` filter
+/// can match the reference against its configured token map.
 fn record_route_decision(ctx: &mut HttpFilterContext<'_>, local_site: &Arc<str>, candidate: &RouteCandidate) {
     ctx.set_metadata("grid.route.kind", candidate.kind.as_str());
     ctx.set_metadata("grid.route.name", &*candidate.name);
     ctx.set_metadata("grid.route.site", &*candidate.site);
     ctx.set_metadata("grid.route.cluster", &*candidate.cluster);
     ctx.set_metadata("grid.route.local_site", &**local_site);
+
+    if let Some(cred) = &candidate.credential {
+        ctx.set_metadata("grid.route.credential.strategy", &cred.strategy);
+        ctx.set_metadata("grid.route.credential.name", &cred.secret_ref.name);
+        ctx.set_metadata("grid.route.credential.namespace", &cred.secret_ref.namespace);
+        ctx.set_metadata("grid.route.credential.key", &cred.secret_ref.key);
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -860,6 +874,139 @@ mod tests {
         assert!(
             ctx.get_metadata("grid.route.kind").is_none(),
             "preserved cluster path should not write route metadata"
+        );
+    }
+
+    // ---- Credential passthrough ----
+
+    #[tokio::test]
+    async fn credential_bearing_candidate_routes_normally() {
+        let yaml = concat!(
+            "local_site: site-a\ncandidates:\n",
+            "  - kind: inference_model\n",
+            "    name: api-model\n",
+            "    site: site-b\n",
+            "    cluster: api-cluster\n",
+            "    fresh: true\n",
+            "    credential:\n",
+            "      strategy: bearer_token\n",
+            "      secretRef:\n",
+            "        name: my-secret\n",
+            "        namespace: default\n",
+            "        key: token\n",
+        );
+        let val: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let f = GridRouteFilter::from_config(&val).unwrap();
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers
+            .insert("X-Model", http::HeaderValue::from_static("api-model"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+
+        let action = f.on_request(&mut ctx).await.unwrap();
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "credential-bearing candidate must route normally"
+        );
+        assert_eq!(ctx.cluster.as_deref(), Some("api-cluster"), "cluster must be set");
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "multi-line YAML fixture for credential passthrough assertion"
+    )]
+    async fn credential_not_written_to_route_metadata() {
+        let yaml = concat!(
+            "local_site: site-a\ncandidates:\n",
+            "  - kind: inference_model\n",
+            "    name: api-model\n",
+            "    site: site-b\n",
+            "    cluster: api-cluster\n",
+            "    fresh: true\n",
+            "    credential:\n",
+            "      strategy: bearer_token\n",
+            "      secretRef:\n",
+            "        name: secret-name\n",
+            "        namespace: default\n",
+            "        key: token-key\n",
+        );
+        let val: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let f = GridRouteFilter::from_config(&val).unwrap();
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers
+            .insert("X-Model", http::HeaderValue::from_static("api-model"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+
+        let _action = f.on_request(&mut ctx).await.unwrap();
+        // Credential values must never appear in filter metadata.
+        for key in [
+            "grid.route.credential",
+            "grid.route.strategy",
+            "grid.route.secret_ref",
+            "grid.route.token",
+        ] {
+            assert!(
+                ctx.get_metadata(key).is_none(),
+                "credential metadata key '{key}' must not be written to filter metadata"
+            );
+        }
+    }
+
+    // ---- Credential metadata propagation ----
+
+    #[tokio::test]
+    async fn credential_reference_written_to_route_metadata() {
+        let yaml = concat!(
+            "local_site: site-a\ncandidates:\n",
+            "  - kind: inference_model\n",
+            "    name: api-model\n",
+            "    site: site-b\n",
+            "    cluster: api-cluster\n",
+            "    fresh: true\n",
+            "    credential:\n",
+            "      strategy: bearer_token\n",
+            "      secretRef:\n",
+            "        name: my-secret\n",
+            "        namespace: grid-system\n",
+            "        key: token\n",
+        );
+        let val: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let f = GridRouteFilter::from_config(&val).unwrap();
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers
+            .insert("X-Model", http::HeaderValue::from_static("api-model"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+
+        let action = f.on_request(&mut ctx).await.unwrap();
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "credential candidate must route"
+        );
+        assert_eq!(ctx.get_metadata("grid.route.credential.strategy"), Some("bearer_token"));
+        assert_eq!(ctx.get_metadata("grid.route.credential.name"), Some("my-secret"));
+        assert_eq!(ctx.get_metadata("grid.route.credential.namespace"), Some("grid-system"));
+        assert_eq!(ctx.get_metadata("grid.route.credential.key"), Some("token"));
+    }
+
+    #[tokio::test]
+    async fn no_credential_metadata_when_candidate_has_no_credential() {
+        let f = make_filter(&[("inference_model", "llama", "site-a", "local-inf")]);
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+
+        let action = f.on_request(&mut ctx).await.unwrap();
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "non-credential candidate must route"
+        );
+        assert!(
+            ctx.get_metadata("grid.route.credential.strategy").is_none(),
+            "no credential metadata on plain candidate"
+        );
+        assert!(
+            ctx.get_metadata("grid.route.credential.name").is_none(),
+            "no credential name on plain candidate"
         );
     }
 

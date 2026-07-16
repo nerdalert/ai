@@ -18,7 +18,7 @@ mod token_count;
 mod token_usage_headers;
 
 pub use agentic::{a2a::A2aFilter, mcp::McpFilter};
-pub use grid::GridRouteFilter;
+pub use grid::{GridCredentialInjectFilter, GridRouteFilter};
 pub use guardrails::AiGuardrailsFilter;
 pub use inference::ModelToHeaderFilter;
 pub use prompt_enrich::PromptEnrichFilter;
