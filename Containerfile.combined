@@ -31,7 +31,7 @@ COPY server/Cargo.toml ./server/Cargo.toml
 COPY server/build.rs ./server/build.rs
 
 # Strip workspace members not needed for the default binary.
-RUN sed -i '/xtask/d; /tests\//d' Cargo.toml
+RUN sed -i '/xtask/d; /tests\//d; /mock-epp/d' Cargo.toml
 
 # Copy the llmd-ext-proc manifest for workspace resolution.
 # The crate is optional and not enabled in the default image.
