@@ -1,0 +1,61 @@
+# syntax=docker/dockerfile:1
+
+FROM rust:1.96-alpine AS builder
+
+ENV OPENSSL_STATIC=1
+
+RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconf cmake make g++
+
+WORKDIR /src
+
+COPY Cargo.toml Cargo.lock ./
+COPY integrations/llmd/ext-proc/Cargo.toml ./integrations/llmd/ext-proc/Cargo.toml
+COPY integrations/llmd/ext-proc/build.rs ./integrations/llmd/ext-proc/build.rs
+COPY integrations/llmd/ext-proc/proto ./integrations/llmd/ext-proc/proto
+COPY integrations/llmd/mock-epp/Cargo.toml ./integrations/llmd/mock-epp/Cargo.toml
+
+RUN grep -v '"server"' Cargo.toml \
+    | grep -v '"filters"' \
+    | grep -v '"apis"' \
+    | grep -v '"xtask"' \
+    | grep -v '"tests/' \
+    > Cargo.toml.tmp \
+    && mv Cargo.toml.tmp Cargo.toml
+
+RUN mkdir -p integrations/llmd/ext-proc/src integrations/llmd/mock-epp/src \
+    && echo '//! stub' > integrations/llmd/ext-proc/src/lib.rs \
+    && printf '//! stub\nfn main() {}\n' > integrations/llmd/mock-epp/src/main.rs
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --release -p praxis-ai-mock-epp
+
+COPY integrations/llmd/ext-proc/src ./integrations/llmd/ext-proc/src
+COPY integrations/llmd/mock-epp/src ./integrations/llmd/mock-epp/src
+
+RUN find integrations/llmd/ext-proc/src integrations/llmd/mock-epp/src \
+    -name '*.rs' -exec touch {} +
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --release -p praxis-ai-mock-epp \
+    && cp target/release/mock-epp /usr/local/bin/mock-epp
+
+FROM alpine:3.23
+
+LABEL org.opencontainers.image.source="https://github.com/praxis-proxy/ai" \
+    org.opencontainers.image.description="Deterministic mock llm-d EPP for Praxis AI integration tests" \
+    org.opencontainers.image.licenses="MIT"
+
+RUN apk add --no-cache ca-certificates \
+    && addgroup -S praxis \
+    && adduser -S -G praxis -h /nonexistent -s /sbin/nologin praxis
+
+COPY --from=builder --chown=root:root --chmod=0555 \
+    /usr/local/bin/mock-epp /usr/local/bin/mock-epp
+
+USER praxis:praxis
+
+EXPOSE 50051
+
+ENTRYPOINT ["mock-epp"]

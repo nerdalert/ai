@@ -57,6 +57,43 @@ impl CapabilityKind {
 }
 
 // -----------------------------------------------------------------------------
+// Credential reference
+// -----------------------------------------------------------------------------
+
+/// Reference to a Kubernetes Secret that holds a bearer token.
+///
+/// Contains only locating information — never the credential value itself.
+/// Safe to persist in a `ConfigMap`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CredentialRef {
+    /// Secret name.
+    pub name: String,
+    /// Secret namespace.
+    pub namespace: String,
+    /// Key within `Secret.data` that holds the credential bytes.
+    pub key: String,
+}
+
+/// Credential reference projected alongside a route candidate.
+///
+/// Identifies the authentication strategy and the Kubernetes Secret that
+/// holds the bearer token.  The filter carries this reference for downstream
+/// consumers; it does not perform Kubernetes API calls or inject the credential
+/// at request time.
+///
+/// Field names use camelCase to match the operator's overlay serialization.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct CandidateCredential {
+    /// Authentication strategy identifier.  Currently `"bearer_token"`.
+    pub strategy: String,
+
+    /// Reference to the Kubernetes Secret that contains the token.
+    pub secret_ref: CredentialRef,
+}
+
+// -----------------------------------------------------------------------------
 // CandidateConfig (serde)
 // -----------------------------------------------------------------------------
 
@@ -91,6 +128,14 @@ pub(crate) struct CandidateConfig {
 
     /// Site that owns this capability.
     pub site: String,
+
+    /// Optional credential reference for upstream authentication.
+    ///
+    /// When present, the upstream identified by this candidate requires a bearer
+    /// token obtained from the referenced Kubernetes Secret.  The filter carries
+    /// this reference for downstream use; it does not resolve the token.
+    #[serde(default)]
+    pub credential: Option<CandidateCredential>,
 }
 
 /// Default freshness state for candidates.
@@ -110,6 +155,11 @@ fn default_fresh() -> bool {
 pub(crate) struct RouteCandidate {
     /// Cluster name to select.
     pub cluster: Arc<str>,
+
+    /// Optional credential reference for upstream authentication.
+    ///
+    /// Carried from the operator overlay; not used by routing logic.
+    pub credential: Option<CandidateCredential>,
 
     /// Whether this candidate is fresh.
     pub fresh: bool,
@@ -134,7 +184,7 @@ pub(crate) struct RouteCandidate {
 ///
 /// Returns [`FilterError`] if:
 /// - the candidate list is empty or exceeds [`MAX_CANDIDATES`]
-/// - any name/site/cluster field is blank or oversized
+/// - any name/site/cluster/credential field is blank or oversized
 /// - duplicate (kind, name, site) tuples exist
 pub(crate) fn validate_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<RouteCandidate>, FilterError> {
     if raw.is_empty() {
@@ -151,6 +201,7 @@ pub(crate) fn validate_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<Route
         validate_name(&format!("candidates[{i}].name"), &c.name)?;
         validate_name(&format!("candidates[{i}].site"), &c.site)?;
         validate_name(&format!("candidates[{i}].cluster"), &c.cluster)?;
+        validate_credential(i, c.credential.as_ref())?;
 
         if !seen.insert((c.kind, c.name.clone(), c.site.clone())) {
             return Err(format!("grid: duplicate candidate '{}/{}/{}'", c.kind.as_str(), c.name, c.site).into());
@@ -158,6 +209,7 @@ pub(crate) fn validate_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<Route
 
         candidates.push(RouteCandidate {
             cluster: Arc::from(c.cluster.as_str()),
+            credential: c.credential,
             fresh: c.fresh,
             kind: c.kind,
             name: Arc::from(c.name.as_str()),
@@ -195,6 +247,29 @@ fn validate_name(field: &str, value: &str) -> Result<(), FilterError> {
         return Err(format!("grid: {field} must be 1-{MAX_NAME_LEN} non-blank characters").into());
     }
     Ok(())
+}
+
+/// Validate optional credential reference fields.
+fn validate_credential(index: usize, credential: Option<&CandidateCredential>) -> Result<(), FilterError> {
+    let Some(credential) = credential else {
+        return Ok(());
+    };
+    validate_name(
+        &format!("candidates[{index}].credential.strategy"),
+        &credential.strategy,
+    )?;
+    validate_name(
+        &format!("candidates[{index}].credential.secretRef.name"),
+        &credential.secret_ref.name,
+    )?;
+    validate_name(
+        &format!("candidates[{index}].credential.secretRef.namespace"),
+        &credential.secret_ref.namespace,
+    )?;
+    validate_name(
+        &format!("candidates[{index}].credential.secretRef.key"),
+        &credential.secret_ref.key,
+    )
 }
 
 // -----------------------------------------------------------------------------
@@ -408,10 +483,156 @@ mod tests {
         let kind: CapabilityKind = serde_yaml::from_str(&format!("\"{kind_str}\"")).unwrap();
         CandidateConfig {
             cluster: cluster.to_owned(),
+            credential: None,
             fresh: true,
             kind,
             name: name.to_owned(),
             site: site.to_owned(),
         }
+    }
+
+    // ---- Credential reference ----
+
+    #[test]
+    fn credential_absent_defaults_to_none() {
+        let candidates = validate_candidates(vec![candidate("inference_model", "m", "s", "c")]).unwrap();
+        assert!(
+            candidates[0].credential.is_none(),
+            "absent credential must default to None"
+        );
+    }
+
+    #[test]
+    fn credential_bearing_candidate_parsed() {
+        // Operator serializes ProjectedCredential with camelCase (secretRef).
+        let yaml = concat!(
+            "- kind: inference_model\n  name: m\n  site: s\n  cluster: c\n",
+            "  credential:\n",
+            "    strategy: bearer_token\n",
+            "    secretRef:\n",
+            "      name: my-secret\n",
+            "      namespace: default\n",
+            "      key: token\n",
+        );
+        let configs: Vec<CandidateConfig> = serde_yaml::from_str(yaml).unwrap();
+        let cred = configs[0].credential.as_ref().unwrap();
+        assert_eq!(cred.strategy, "bearer_token", "strategy must parse");
+        assert_eq!(cred.secret_ref.name, "my-secret", "secretRef.name must parse");
+        assert_eq!(cred.secret_ref.namespace, "default", "secretRef.namespace must parse");
+        assert_eq!(cred.secret_ref.key, "token", "secretRef.key must parse");
+    }
+
+    #[test]
+    fn unknown_credential_field_rejected() {
+        let yaml = concat!(
+            "- kind: inference_model\n  name: m\n  site: s\n  cluster: c\n",
+            "  credential:\n",
+            "    strategy: bearer_token\n",
+            "    unexpected: nope\n",
+            "    secretRef:\n",
+            "      name: sec\n",
+            "      namespace: ns\n",
+            "      key: k\n",
+        );
+        let err = serde_yaml::from_str::<Vec<CandidateConfig>>(yaml);
+        assert!(err.is_err(), "unknown credential fields must be rejected");
+    }
+
+    #[test]
+    fn unknown_secret_ref_field_rejected() {
+        let yaml = concat!(
+            "- kind: inference_model\n  name: m\n  site: s\n  cluster: c\n",
+            "  credential:\n",
+            "    strategy: bearer_token\n",
+            "    secretRef:\n",
+            "      name: sec\n",
+            "      namespace: ns\n",
+            "      key: k\n",
+            "      tokenValue: must-not-parse\n",
+        );
+        let err = serde_yaml::from_str::<Vec<CandidateConfig>>(yaml);
+        assert!(err.is_err(), "unknown secretRef fields must be rejected");
+    }
+
+    #[test]
+    fn blank_credential_secret_ref_field_rejected() {
+        let yaml = concat!(
+            "- kind: inference_model\n  name: m\n  site: s\n  cluster: c\n",
+            "  credential:\n",
+            "    strategy: bearer_token\n",
+            "    secretRef:\n",
+            "      name: sec\n",
+            "      namespace: '   '\n",
+            "      key: k\n",
+        );
+        let configs: Vec<CandidateConfig> = serde_yaml::from_str(yaml).unwrap();
+        let err = validate_candidates(configs).unwrap_err();
+        assert!(
+            err.to_string().contains("credential.secretRef.namespace"),
+            "blank credential namespace should be rejected with field context: {err}"
+        );
+    }
+
+    #[test]
+    fn oversized_credential_secret_ref_field_rejected() {
+        let long = "a".repeat(MAX_NAME_LEN + 1);
+        let yaml = format!(
+            "- kind: inference_model\n  name: m\n  site: s\n  cluster: c\n\
+             \x20 credential:\n\
+             \x20   strategy: bearer_token\n\
+             \x20   secretRef:\n\
+             \x20     name: sec\n\
+             \x20     namespace: ns\n\
+             \x20     key: {long}\n"
+        );
+        let configs: Vec<CandidateConfig> = serde_yaml::from_str(&yaml).unwrap();
+        let err = validate_candidates(configs).unwrap_err();
+        assert!(
+            err.to_string().contains("credential.secretRef.key"),
+            "oversized credential key should be rejected with field context: {err}"
+        );
+    }
+
+    #[test]
+    fn credential_threads_through_validation() {
+        let yaml = concat!(
+            "- kind: inference_model\n  name: m\n  site: s\n  cluster: c\n",
+            "  credential:\n",
+            "    strategy: bearer_token\n",
+            "    secretRef:\n",
+            "      name: sec\n",
+            "      namespace: ns\n",
+            "      key: k\n",
+        );
+        let configs: Vec<CandidateConfig> = serde_yaml::from_str(yaml).unwrap();
+        let validated = validate_candidates(configs).unwrap();
+        let cred = validated[0].credential.as_ref().unwrap();
+        assert_eq!(
+            cred.strategy, "bearer_token",
+            "credential must survive validate_candidates"
+        );
+        assert_eq!(
+            cred.secret_ref.name, "sec",
+            "secretRef.name must survive validate_candidates"
+        );
+    }
+
+    #[test]
+    fn credential_does_not_affect_routing_fields() {
+        let yaml = concat!(
+            "- kind: inference_model\n  name: api-model\n  site: site-b\n  cluster: api-cluster\n",
+            "  credential:\n",
+            "    strategy: bearer_token\n",
+            "    secretRef:\n",
+            "      name: sec\n",
+            "      namespace: ns\n",
+            "      key: k\n",
+        );
+        let configs: Vec<CandidateConfig> = serde_yaml::from_str(yaml).unwrap();
+        let validated = validate_candidates(configs).unwrap();
+        assert_eq!(&*validated[0].name, "api-model", "name must be preserved");
+        assert_eq!(&*validated[0].site, "site-b", "site must be preserved");
+        assert_eq!(&*validated[0].cluster, "api-cluster", "cluster must be preserved");
+        assert!(validated[0].fresh, "fresh must default to true");
     }
 }

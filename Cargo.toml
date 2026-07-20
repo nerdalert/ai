@@ -5,6 +5,7 @@ members = [
     "filters",
     "apis",
     "integrations/llmd/ext-proc",
+    "integrations/llmd/mock-epp",
     "xtask",
     "tests/environment",
     "tests/integration",

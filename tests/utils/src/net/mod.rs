@@ -22,9 +22,9 @@ pub use http_client::{
 };
 pub use port::{PortGuard, bind_unique_port, free_port, free_port_guard, free_port_v6, ipv6_available};
 pub use postgres::{PostgresGuard, start_postgres};
+pub use simulator::{SimulatorGuard, start_simulator, start_simulator_with_model};
 pub use tls::{
     ClientCert, TestCertificates, https_get, start_mtls_backend, start_tcp_echo_backend, start_tcp_tagged_backend,
     start_tls_backend, tls_connection_rejected, tls_send_recv, wait_for_https, wait_for_tls,
 };
-pub use simulator::{SimulatorGuard, start_simulator, start_simulator_with_model};
 pub use wait::{wait_for_http, wait_for_http2, wait_for_tcp};
