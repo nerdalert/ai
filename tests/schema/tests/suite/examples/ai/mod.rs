@@ -5,4 +5,4 @@
 
 mod grid_route;
 mod model_to_header;
-mod responses_proxy;
+mod openai_responses_proxy;

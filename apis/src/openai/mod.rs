@@ -3,6 +3,12 @@
 
 //! `OpenAI` API filters: Responses API pipeline.
 
+#[expect(clippy::allow_attributes, reason = "dead_code expect unfulfilled on module")]
+#[allow(
+    dead_code,
+    reason = "api_base_url and timeout are wired in by the vector-store search client (#312)"
+)]
+pub(crate) mod api_client;
 pub(crate) mod conversations;
 pub(crate) mod responses;
 pub(crate) mod sse;
@@ -15,6 +21,7 @@ pub(crate) mod translation;
 
 pub use conversations::OpenaiConversationsFilter;
 pub use responses::{
-    ModelRewriteFilter, OpenaiResponsesValidateFilter, RehydrateFilter, ResponseStoreFilter, ResponsesFormatFilter,
-    ToolParseFilter, proxy::ResponsesProxyFilter, stream_events::OpenaiStreamEventsFilter,
+    DocExtractFilter, FileResolveFilter, McpDispatchFilter, McpToolResolveFilter, ModelRewriteFilter,
+    OpenaiResponsesValidateFilter, RehydrateFilter, ResponseStoreFilter, ResponsesFormatFilter, ToolParseFilter,
+    WebSearchFilter, openai_responses_proxy::ResponsesProxyFilter, stream_events::OpenaiStreamEventsFilter,
 };

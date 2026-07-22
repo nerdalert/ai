@@ -151,6 +151,14 @@ fn register_openai_filters(registry: &mut praxis_filter::FilterRegistry) {
 fn register_openai_responses_filters(registry: &mut praxis_filter::FilterRegistry) {
     praxis_filter::register_filters!(
         @register registry,
+        http "openai_doc_extract" => praxis_ai_apis::openai::DocExtractFilter::from_config
+    );
+    praxis_filter::register_filters!(
+        @register registry,
+        http "openai_file_resolve" => praxis_ai_apis::openai::FileResolveFilter::from_config
+    );
+    praxis_filter::register_filters!(
+        @register registry,
         http "openai_responses_format" => praxis_ai_apis::openai::ResponsesFormatFilter::from_config
     );
     praxis_filter::register_filters!(
@@ -180,11 +188,23 @@ fn register_openai_response_filters(registry: &mut praxis_filter::FilterRegistry
     );
     praxis_filter::register_filters!(
         @register registry,
-        http "responses_proxy" => praxis_ai_apis::openai::ResponsesProxyFilter::from_config
+        http "openai_responses_proxy" => praxis_ai_apis::openai::ResponsesProxyFilter::from_config
     );
     praxis_filter::register_filters!(
         @register registry,
-        http "tool_parse" => praxis_ai_apis::openai::ToolParseFilter::from_config
+        http "openai_mcp_tool_resolve" => praxis_ai_apis::openai::McpToolResolveFilter::from_config
+    );
+    praxis_filter::register_filters!(
+        @register registry,
+        http "openai_tool_parse" => praxis_ai_apis::openai::ToolParseFilter::from_config
+    );
+    praxis_filter::register_filters!(
+        @register registry,
+        http "openai_web_search" => praxis_ai_apis::openai::WebSearchFilter::from_config
+    );
+    praxis_filter::register_filters!(
+        @register registry,
+        http "openai_mcp_dispatch" => praxis_ai_apis::openai::McpDispatchFilter::from_config
     );
 }
 

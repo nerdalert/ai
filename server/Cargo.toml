@@ -20,6 +20,7 @@ path = "src/main.rs"
 [features]
 default = []
 llmd-ext-proc = ["dep:praxis-ai-llmd-ext-proc"]
+praxis-main = ["praxis-ai-filters/praxis-main", "praxis-ai-apis/praxis-main"]
 
 [lints]
 workspace = true

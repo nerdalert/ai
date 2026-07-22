@@ -105,6 +105,23 @@ pub trait ConversationItemStore: Send + Sync {
         messages: &serde_json::Value,
     ) -> Result<bool, StoreError>;
 
+    /// Replace the denormalized message cache only when it still equals
+    /// `expected_messages`.
+    ///
+    /// Returns `true` when the compare-and-swap succeeds and `false` after a
+    /// concurrent cache update or when the conversation does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if serialization or the database operation fails.
+    async fn compare_and_swap_conversation_messages(
+        &self,
+        tenant_id: &str,
+        conversation_id: &str,
+        expected_messages: &serde_json::Value,
+        messages: &serde_json::Value,
+    ) -> Result<bool, StoreError>;
+
     /// Retrieve conversation messages by conversation ID and tenant.
     ///
     /// Returns `None` if the conversation does not exist or belongs
@@ -122,9 +139,10 @@ pub trait ConversationItemStore: Send + Sync {
     /// Delete a conversation by ID, scoped to a tenant.
     ///
     /// Returns `true` if a record was deleted, `false` if no
-    /// matching record existed for this tenant. This does not delete
-    /// conversation item rows; items are deleted only through
-    /// [`delete_conversation_item`].
+    /// matching record existed for this tenant. To match the OpenAI
+    /// Conversations API, this does not delete conversation item rows; items
+    /// are deleted only through [`delete_conversation_item`] or an explicit
+    /// retention cleanup path.
     ///
     /// # Errors
     ///

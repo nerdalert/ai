@@ -919,13 +919,16 @@ fn build_json_rpc_config(max_body_bytes: usize) -> JsonRpcConfig {
         json_rpc::config::{BatchPolicy, JsonRpcHeaders},
     };
 
+    let headers = JsonRpcHeaders {
+        id: None,
+        kind: None,
+        method: None,
+    };
+
     JsonRpcConfig {
         batch_policy: BatchPolicy::Reject,
-        headers: JsonRpcHeaders {
-            id: None,
-            kind: None,
-            method: None,
-        },
+        headers,
+        max_batch_size: 100,
         max_body_bytes,
         on_invalid: OnInvalidBehavior::Continue,
     }

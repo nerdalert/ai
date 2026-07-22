@@ -5,10 +5,12 @@
 //!
 //! [`ResponsesState`] is stored in [`RequestExtensions`] and shared
 //! across filter phases. It holds the heavy data needed by the
-//! validate → rehydrate → `tool_parse` → `responses_proxy` →
+//! validate → rehydrate → `openai_tool_parse` → `openai_responses_proxy` →
 //! `stream_events` → `tool_dispatch` pipeline.
 //!
 //! [`RequestExtensions`]: praxis_filter::RequestExtensions
+
+use std::collections::HashMap;
 
 /// Request-scoped state shared across Responses API filters.
 ///
@@ -43,6 +45,12 @@ pub(crate) struct ResponsesState {
     /// optional sections to populate.
     pub include: Vec<String>,
 
+    /// Whether stored history was successfully resolved into this state.
+    ///
+    /// The proxy uses this to distinguish locally consumed history identifiers
+    /// from provider-owned identifiers that must pass through unchanged.
+    pub history_rehydrated: bool,
+
     /// The current request's input items, immutable after construction.
     ///
     /// Preserved as-is so downstream filters can inspect what the
@@ -60,18 +68,22 @@ pub(crate) struct ResponsesState {
     /// no explicit limit was set by the client.
     pub max_tool_calls: Option<u32>,
 
+    /// Resolved MCP tool definitions keyed by `(server_label,
+    /// tool_name)`.
+    ///
+    /// Built by `openai_mcp_tool_resolve` from `tools/list` responses.
+    /// Consumed by `mcp_tool` (#27) for dispatch routing.
+    pub mcp_tool_map: HashMap<(String, String), serde_json::Value>,
+
     /// Resolved conversation history sent to the backend.
     ///
     /// Initialized from the current request's input. When
     /// `previous_response_id` is set, `rehydrate` prepends stored
     /// history. `tool_dispatch` appends tool results during agentic
-    /// loops. `responses_proxy` reads this as the authoritative
+    /// loops. `openai_responses_proxy` reads this as the authoritative
     /// conversation to send to the backend. Output-only metadata
     /// items must be omitted from this field.
     pub messages: Vec<serde_json::Value>,
-
-    /// Output items accumulated across the current response.
-    pub output_items: Vec<serde_json::Value>,
 
     /// Whether tool calls may execute concurrently within an
     /// iteration. Defaults to `true` per the API spec.
@@ -130,11 +142,12 @@ impl Default for ResponsesState {
             context_management: None,
             conversation: None,
             include: Vec::new(),
+            history_rehydrated: false,
             input: Vec::new(),
             iteration: 0,
             max_tool_calls: None,
+            mcp_tool_map: HashMap::new(),
             messages: Vec::new(),
-            output_items: Vec::new(),
             parallel_tool_calls: true,
             persisted_messages: Vec::new(),
             previous_response_id: None,
@@ -177,6 +190,36 @@ impl ResponsesState {
             tools,
             ..Default::default()
         }
+    }
+
+    /// Borrow the public output owned by [`Self::response_object`].
+    #[cfg(test)]
+    pub(crate) fn output_items(&self) -> &[serde_json::Value] {
+        self.response_object
+            .get("output")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    /// Mutably borrow public output, creating a valid array when absent.
+    pub(crate) fn output_items_mut(&mut self) -> &mut Vec<serde_json::Value> {
+        if !self.response_object.is_object() {
+            self.response_object = serde_json::Value::Object(serde_json::Map::new());
+        }
+        let serde_json::Value::Object(response) = &mut self.response_object else {
+            unreachable!("response_object was normalized to an object")
+        };
+        let output = response
+            .entry("output".to_owned())
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+        if !output.is_array() {
+            *output = serde_json::Value::Array(Vec::new());
+        }
+        let serde_json::Value::Array(items) = output else {
+            unreachable!("output was normalized to an array")
+        };
+        items
     }
 }
 
@@ -467,8 +510,9 @@ mod tests {
         assert!(state.input.is_empty());
         assert_eq!(state.iteration, 0);
         assert!(state.max_tool_calls.is_none());
+        assert!(state.mcp_tool_map.is_empty());
         assert!(state.messages.is_empty());
-        assert!(state.output_items.is_empty());
+        assert!(state.output_items().is_empty());
         assert!(state.parallel_tool_calls);
         assert!(state.persisted_messages.is_empty());
         assert!(state.previous_response_id.is_none());
@@ -487,5 +531,47 @@ mod tests {
         let body = json!({"model": "gpt-4o", "input": "test", "parallel_tool_calls": false});
         let state = ResponsesState::from_request_body(body);
         assert!(!state.parallel_tool_calls);
+    }
+
+    #[test]
+    fn response_object_is_the_single_output_owner() {
+        let first = json!({"type": "message", "id": "msg_1"});
+        let second = json!({"type": "reasoning", "id": "rs_1"});
+        let mut state = ResponsesState {
+            response_object: json!({"id": "resp_1", "output": [first.clone()]}),
+            ..Default::default()
+        };
+
+        state.output_items_mut().push(second.clone());
+        assert_eq!(state.output_items(), &[first.clone(), second.clone()]);
+        assert_eq!(state.response_object["output"], json!([first, second]));
+        assert_eq!(state.response_object["id"], "resp_1");
+    }
+
+    #[test]
+    fn mutable_output_normalizes_missing_or_malformed_response_output() {
+        let mut state = ResponsesState {
+            response_object: json!({"id": "resp_1", "output": "invalid"}),
+            ..Default::default()
+        };
+
+        state.output_items_mut().push(json!({"type": "message"}));
+
+        assert_eq!(state.output_items().len(), 1);
+        assert!(state.response_object["output"].is_array());
+        assert_eq!(state.response_object["id"], "resp_1");
+    }
+
+    #[test]
+    fn default_has_empty_mcp_tool_map() {
+        let state = ResponsesState::default();
+        assert!(state.mcp_tool_map.is_empty(), "default mcp_tool_map should be empty");
+    }
+
+    #[test]
+    fn from_request_body_has_empty_mcp_tool_map() {
+        let body = json!({"model": "gpt-4o", "input": "test"});
+        let state = ResponsesState::from_request_body(body);
+        assert!(state.mcp_tool_map.is_empty(), "initial mcp_tool_map should be empty");
     }
 }

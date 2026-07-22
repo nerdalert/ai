@@ -13,31 +13,39 @@ name = "praxis_ai_apis"
 
 [features]
 default = ["store"]
-store = ["dep:sqlx", "dep:dashmap", "dep:tokio"]
+store = ["dep:sqlx", "dep:dashmap"]
+praxis-main = []
 
 [lints]
 workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
+base64 = { workspace = true }
 bytes = { workspace = true }
 dashmap = { workspace = true, optional = true }
 http = { workspace = true }
 percent-encoding = { workspace = true }
-praxis-core = { workspace = true }
+praxis-core = { workspace = true, features = ["callout"] }
 praxis-filter = { workspace = true }
 regex = { workspace = true }
+reqwest = { workspace = true }
+rmcp = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 sqlx = { workspace = true, optional = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, optional = true, features = ["rt", "time", "net"] }
+tokio = { workspace = true, features = ["rt", "time", "net"] }
 tracing = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
+axum = { workspace = true }
 chrono = { workspace = true }
+rmcp = { workspace = true, features = ["server", "macros", "transport-streamable-http-server"] }
+schemars = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio-util = { workspace = true }

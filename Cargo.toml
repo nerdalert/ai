@@ -5,7 +5,6 @@ members = [
     "filters",
     "apis",
     "integrations/llmd/ext-proc",
-    "integrations/llmd/mock-epp",
     "xtask",
     "tests/environment",
     "tests/integration",
@@ -25,6 +24,7 @@ repository = "https://github.com/praxis-proxy/ai"
 async-trait = "0.1.89"
 base64 = "0.22.1"
 bytes = "1.12.0"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 clap = { version = "4.6.1", features = ["derive"] }
 dashmap = "6.2.1"
@@ -38,13 +38,15 @@ quote = "1.0.46"
 rand = "0.10.1"
 rcgen = "0.14.8"
 regex = "1.12.4"
-reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
+rmcp = { version = "2.0.0", default-features = false, features = ["client", "transport-streamable-http-client-reqwest", "reqwest"] }
 rustls = "0.23.41"
+schemars = "1.2.1"
 rustls-pemfile = "2.2.0"
 secrecy = { version = "0.10.3", features = ["serde"] }
 serde = { version = "1.0.228", features = ["derive", "rc"] }
 serde_json = { version = "1.0.150", features = ["preserve_order"] }
-syn = { version = "2.0.118", features = ["full", "extra-traits", "visit"] }
+syn = { version = "3.0.3", features = ["full", "extra-traits", "visit"] }
 serde_yaml = { package = "yaml_serde", version = "0.10.4" }
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "sqlite", "postgres"] }
 tempfile = "3.27.0"
@@ -52,7 +54,7 @@ thiserror = "2.0.18"
 tikv-jemallocator = "0.7.0"
 tokio = { version = "1.52.3", features = ["macros", "rt"] }
 tokio-rustls = "0.26.4"
-tokio-tungstenite = "0.29.0"
+tokio-tungstenite = "0.30.0"
 tokio-util = "0.7.18"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
@@ -70,14 +72,11 @@ tokio-stream = "0.1.18"
 zeroize = "1.9.0"
 
 # Praxis core dependencies
-# Temporary pin: 546871d has ext_proc support APIs needed by llm-d integration.
-# grid_route (from #339) also compiles against this pin; it uses only selects_cluster(),
-# get_metadata/set_metadata, and cluster — all available at 546871d.
-praxis-core = { git = "https://github.com/praxis-proxy/praxis.git", rev = "546871d8fdb85a6b0260e77ee4a63083c1c097fb", package = "praxis-proxy-core" }
-praxis-filter = { git = "https://github.com/praxis-proxy/praxis.git", rev = "546871d8fdb85a6b0260e77ee4a63083c1c097fb", package = "praxis-proxy-filter" }
-praxis-protocol = { git = "https://github.com/praxis-proxy/praxis.git", rev = "546871d8fdb85a6b0260e77ee4a63083c1c097fb", package = "praxis-proxy-protocol" }
-praxis-tls = { git = "https://github.com/praxis-proxy/praxis.git", rev = "546871d8fdb85a6b0260e77ee4a63083c1c097fb", package = "praxis-proxy-tls" }
-praxis = { git = "https://github.com/praxis-proxy/praxis.git", rev = "546871d8fdb85a6b0260e77ee4a63083c1c097fb", package = "praxis-proxy" }
+praxis-core = { version = "0.4.1", package = "praxis-proxy-core" }
+praxis-filter = { version = "0.4.1", package = "praxis-proxy-filter" }
+praxis-protocol = { version = "0.4.1", package = "praxis-proxy-protocol" }
+praxis-tls = { version = "0.4.1", package = "praxis-proxy-tls" }
+praxis = { version = "0.4.1", package = "praxis-proxy" }
 praxis-test-utils = { path = "tests/utils" }
 
 # AI-owned llm-d ext_proc compatibility layer
