@@ -5,6 +5,7 @@ members = [
     "filters",
     "apis",
     "integrations/llmd/ext-proc",
+    "integrations/llmd/mock-epp",
     "xtask",
     "tests/environment",
     "tests/integration",
@@ -72,7 +73,7 @@ tokio-stream = "0.1.18"
 zeroize = "1.9.0"
 
 # Praxis core dependencies
-praxis-core = { version = "0.4.1", package = "praxis-proxy-core" }
+praxis-core = { version = "0.4.1", package = "praxis-proxy-core", features = ["callout"] }
 praxis-filter = { version = "0.4.1", package = "praxis-proxy-filter" }
 praxis-protocol = { version = "0.4.1", package = "praxis-proxy-protocol" }
 praxis-tls = { version = "0.4.1", package = "praxis-proxy-tls" }

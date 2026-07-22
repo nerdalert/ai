@@ -3076,6 +3076,7 @@ dependencies = [
  "tokio",
  "tracing",
  "yaml_serde",
+ "zeroize",
 ]
 
 [[package]]
@@ -3104,6 +3105,22 @@ dependencies = [
  "tonic-prost-build",
  "tracing",
  "yaml_serde",
+]
+
+[[package]]
+name = "praxis-ai-mock-epp"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "clap",
+ "futures",
+ "praxis-ai-llmd-ext-proc",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

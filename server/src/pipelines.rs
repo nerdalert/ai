@@ -5,7 +5,7 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use praxis_core::config::{Config, InsecureOptions};
+use praxis_core::config::{Config, SkipPipelineChecks};
 use praxis_filter::{FilterPipeline, FilterRegistry};
 use praxis_protocol::ListenerPipelines;
 
@@ -49,7 +49,7 @@ pub fn resolve_pipelines(
         let mut pipeline = FilterPipeline::build_with_chains(&mut entries, registry, &chains)?;
         configure_pipeline(&mut pipeline, config, health_registry, kv_stores)?;
 
-        validate_pipeline(&pipeline, &entries, &listener.name, &config.insecure_options)?;
+        validate_pipeline(&pipeline, &entries, &listener.name, config)?;
 
         pipelines.insert(listener.name.clone(), Arc::new(pipeline));
     }
@@ -92,13 +92,15 @@ fn validate_pipeline(
     pipeline: &FilterPipeline,
     entries: &[praxis_core::config::FilterEntry],
     listener_name: &str,
-    insecure_options: &InsecureOptions,
+    config: &Config,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let errors = pipeline.ordering_errors(
-        entries,
-        insecure_options.allow_open_security_filters,
-        &insecure_options.effective_pipeline_checks(),
-    );
+    let insecure_options = &config.insecure_options;
+    let skip_checks = if insecure_options.skip_pipeline_validation {
+        SkipPipelineChecks::default()
+    } else {
+        insecure_options.effective_pipeline_checks()
+    };
+    let errors = pipeline.ordering_errors(entries, insecure_options.allow_open_security_filters, &skip_checks);
 
     if insecure_options.skip_pipeline_validation {
         for msg in &errors {
