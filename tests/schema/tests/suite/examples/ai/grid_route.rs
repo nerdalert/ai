@@ -71,6 +71,29 @@ fn grid_route_inference_rejects_unknown_model_with_404() {
 }
 
 // -----------------------------------------------------------------------------
+// MCP tool routing tests
+// -----------------------------------------------------------------------------
+
+#[test]
+fn grid_route_mcp_routes_known_tool() {
+    let local_port = start_backend("code-search-response");
+    let remote_port = start_backend("weather-response");
+    let proxy_port = free_port();
+
+    let yaml = make_mcp_yaml(proxy_port, local_port, remote_port);
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let (status, body) = http_post(
+        proxy.addr(),
+        "/mcp",
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"weather-lookup","arguments":{}}}"#,
+    );
+    assert_eq!(status, 200, "known MCP tool should route");
+    assert_eq!(body, "weather-response", "should select the tool-owning cluster");
+}
+
+// -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------
 
@@ -110,6 +133,45 @@ filter_chains:
             endpoints:
               - "127.0.0.1:{local_port}"
           - name: llama-remote
+            endpoints:
+              - "127.0.0.1:{remote_port}"
+"#
+    )
+}
+
+/// Build YAML config that mirrors the grid-route-mcp.yaml example
+/// with dynamic ports substituted in.
+fn make_mcp_yaml(proxy_port: u16, local_port: u16, remote_port: u16) -> String {
+    format!(
+        r#"
+listeners:
+  - name: proxy
+    address: "127.0.0.1:{proxy_port}"
+    filter_chains:
+      - main
+filter_chains:
+  - name: main
+    filters:
+      - filter: mcp
+      - filter: grid_route
+        local_site: site-a
+        candidates:
+          - kind: mcp_tool
+            name: weather-lookup
+            site: site-b
+            cluster: tools-site-b
+            fresh: true
+          - kind: mcp_tool
+            name: code-search
+            site: site-a
+            cluster: tools-site-a
+            fresh: true
+      - filter: load_balancer
+        clusters:
+          - name: tools-site-a
+            endpoints:
+              - "127.0.0.1:{local_port}"
+          - name: tools-site-b
             endpoints:
               - "127.0.0.1:{remote_port}"
 "#
