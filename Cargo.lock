@@ -2767,6 +2767,7 @@ dependencies = [
  "futures",
  "http",
  "nix",
+ "praxis-ai-llmd-ext-proc",
  "praxis-ai-proxy",
  "praxis-proxy-core",
  "praxis-proxy-filter",
@@ -2778,7 +2779,9 @@ dependencies = [
  "sqlx",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "tokio-tungstenite",
+ "tonic",
 ]
 
 [[package]]

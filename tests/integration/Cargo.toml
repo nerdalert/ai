@@ -9,6 +9,7 @@ publish = false
 
 [features]
 cpex-policy-engine = []
+llmd-ext-proc = ["praxis-test-utils/llmd-ext-proc"]
 no-mac-cert-rotation-tests = [] # We use this to disable testing cert rotation on macOS
 praxis-main = ["praxis-test-utils/praxis-main"]
 
@@ -22,6 +23,7 @@ futures = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
 nix = { workspace = true }
+praxis-ai-llmd-ext-proc = { workspace = true }
 praxis-core = { workspace = true }
 praxis-ai-proxy = { workspace = true }
 praxis-filter = { workspace = true }
@@ -32,5 +34,7 @@ sha2 = { workspace = true }
 sqlx = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "process"] }
+tokio-stream = { workspace = true }
 tokio-tungstenite = { workspace = true }
 rustls-pemfile = { workspace = true }
+tonic = { workspace = true }
