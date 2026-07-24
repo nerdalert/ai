@@ -14,19 +14,28 @@
 //! MCP metadata takes precedence over the model header to prevent a
 //! client-supplied model name from hijacking MCP routing.
 //!
-//! Candidate selection is deterministic.  Fresh candidates score 0;
-//! stale candidates receive -100.  Candidates on `local_site` receive
-//! +10.  First configured candidate wins when scores are equal.
+//! Candidate selection is deterministic and lexicographic:
+//! 1. **Freshness class** — fresh (0) beats stale (-100).
+//! 2. **Locality** — local site (+10) beats remote within the same freshness class.
+//! 3. **Config order** — first configured candidate wins on equal scores.
+//!
+//! This is the `grid_route` filter's own scoring; it is not a
+//! recomputation of Grid's ranking.  Grid-rendered order is used
+//! only as the tie-break within equal scores.
 //!
 //! No request-time metrics or control-plane lookups are performed.
 
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use praxis_filter::{FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config};
 use serde::Deserialize;
 
-use super::descriptor::{self, CandidateConfig, CapabilityKind, RouteCandidate};
+use super::{
+    descriptor::{self, CandidateConfig, CapabilityKind, RouteCandidate},
+    overlay::{self, OverlayReloadHandle, RouteSnapshot},
+};
 
 /// Maximum length for header values read from the request.
 const MAX_HEADER_VALUE_LEN: usize = 256;
@@ -43,6 +52,10 @@ const LOCAL_PREFERENCE: i32 = 10;
 
 /// Deserialized YAML config for the grid route filter.
 ///
+/// Supports two modes:
+///
+/// **Static mode** — candidates and `local_site` are specified inline:
+///
 /// ```yaml
 /// filter: grid_route
 /// local_site: site-a
@@ -53,18 +66,62 @@ const LOCAL_PREFERENCE: i32 = 10;
 ///     site: site-a
 ///     cluster: local-inference
 /// ```
+///
+/// **Overlay mode** — candidates are loaded from a Grid overlay file:
+///
+/// ```yaml
+/// filter: grid_route
+/// overlay_file: /etc/grid/grid-config.json
+/// model_header: x-model
+/// ```
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GridRouteConfig {
-    /// Static list of route candidates.
-    candidates: Vec<CandidateConfig>,
+    /// Static list of route candidates (mutually exclusive with `overlay_file`).
+    candidates: Option<Vec<CandidateConfig>>,
 
-    /// Name of the local site.
-    local_site: String,
+    /// Name of the local site (required in static mode, provided by overlay
+    /// in overlay mode).
+    local_site: Option<String>,
 
     /// Header name that carries the model name (default: `X-Model`).
     #[serde(default = "default_model_header")]
     model_header: String,
+
+    /// Path to a Grid overlay JSON file (`grid-config.json`).
+    ///
+    /// When set, candidates and `local_site` are read from the overlay
+    /// instead of the YAML config.
+    overlay_file: Option<PathBuf>,
+
+    /// Hot reload configuration for overlay mode.
+    ///
+    /// Only valid when `overlay_file` is set.  Providing a `reload:`
+    /// block with static `candidates` is rejected — static candidates
+    /// are immutable for the lifetime of the filter.
+    reload: Option<ReloadConfig>,
+}
+
+/// Hot reload settings for overlay file watching.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReloadConfig {
+    /// Whether file watching is enabled (default: `true`).
+    #[serde(default = "default_reload_enabled")]
+    enabled: bool,
+
+    /// Debounce window in milliseconds (default: 500).
+    #[serde(default = "default_debounce_ms")]
+    debounce_ms: u64,
+}
+
+impl Default for ReloadConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_reload_enabled(),
+            debounce_ms: default_debounce_ms(),
+        }
+    }
 }
 
 /// Default model header name.
@@ -72,17 +129,32 @@ fn default_model_header() -> String {
     "X-Model".to_owned()
 }
 
+/// Default reload enabled state.
+fn default_reload_enabled() -> bool {
+    true
+}
+
+/// Default debounce window in milliseconds.
+fn default_debounce_ms() -> u64 {
+    overlay::DEFAULT_DEBOUNCE_MS
+}
+
 // -----------------------------------------------------------------------------
 // GridRouteFilter
 // -----------------------------------------------------------------------------
 
-/// Selects an upstream cluster from a static site/capability descriptor
+/// Selects an upstream cluster from a site/capability descriptor
 /// by matching either an inference model name or MCP tool name.
 ///
 /// This filter is registered by the AI proxy (not Praxis core) because it
 /// encodes AI/Grid-specific routing semantics: candidate freshness preference,
 /// local-site scoring, and MCP tool-call routing.  Praxis core provides the
 /// generic filter runtime; this filter adds the Grid candidate model on top.
+///
+/// **Modes:**
+/// - **Static:** candidates are declared inline in the YAML config.
+/// - **Overlay:** candidates are loaded from a Grid `grid-config.json` file and hot-reloaded via [`ArcSwap`] when the
+///   file changes.
 ///
 /// **Behavior:**
 /// - If `ctx.cluster` is already set by an earlier filter, the selection is preserved and no metadata is written.
@@ -91,10 +163,12 @@ fn default_model_header() -> String {
 /// - If a matching candidate is found, `ctx.cluster` is set and bounded route-decision metadata is written.
 /// - If no matching candidate is found, the filter rejects with 404.
 ///
-/// **Scoring:** candidates are scored deterministically.  Fresh candidates
-/// score 0; stale candidates receive -100.  Candidates on `local_site`
-/// receive +10.  Freshness is stronger than local preference.  First
-/// configured candidate wins on equal scores.
+/// **Scoring:** candidates are scored deterministically with
+/// lexicographic priority: fresh (0) beats stale (-100); local
+/// site (+10) beats remote within the same freshness class; first
+/// configured candidate wins on equal scores.  This is the
+/// `grid_route` filter's own scoring, not a recomputation of
+/// Grid's ranking.
 ///
 /// **Metadata:** on successful selection, bounded in-process filter
 /// metadata is written under the `grid.route.` namespace (`kind`, `name`,
@@ -105,35 +179,107 @@ fn default_model_header() -> String {
 /// **MCP lookup:** if `mcp.method` filter metadata is set to `tools/call`
 /// and `mcp.name` is present, `mcp_tool` candidates are matched.
 /// Other MCP methods (`initialize`, `notifications/*`, etc.) skip routing.
+///
+/// **Hot reload:** when `reload.enabled` is `true` (the default in overlay
+/// mode), the filter watches the overlay file's parent directory for
+/// filesystem events.  On change, the file is re-read, SHA-256 hashed
+/// (skipped if identical), parsed, validated, and atomically swapped in
+/// via `ArcSwap`.  In-flight requests continue using their previously
+/// loaded snapshot.  Unreadable or invalid files retain the previous
+/// snapshot.  Kubernetes `ConfigMap` projected volumes use atomic symlink
+/// replacement (`..data`), which the watcher detects as a Create/Modify
+/// event on the parent directory.  The overlay `ConfigMap` **must not**
+/// use `subPath` volume mounts — `subPath` bypasses the `..data` symlink
+/// mechanism and the watcher will not detect updates.
+///
+/// **Scope:** overlay hot reload swaps the candidate list and `local_site`
+/// only.  It cannot add or remove `load_balancer` clusters, change
+/// cluster endpoints or TLS configuration, or inject credential values.
+/// Those changes require a full pipeline reload or pod restart.
+/// Every cluster name that may appear in any overlay version must
+/// already be configured in the downstream `load_balancer` filter.
+/// An overlay that references an unknown cluster will cause
+/// request-time failures, not a reload rejection.
+///
+/// [`ArcSwap`]: arc_swap::ArcSwap
 pub struct GridRouteFilter {
-    /// Validated route candidates.
-    candidates: Vec<RouteCandidate>,
-    /// Local site identifier for scoring and metadata.
-    local_site: Arc<str>,
+    /// Atomic snapshot of routing state (candidates + `local_site`).
+    snapshot: Arc<ArcSwap<RouteSnapshot>>,
     /// Header that carries the model name.
     model_header: http::header::HeaderName,
+    /// Watcher handle for overlay hot reload (None in static mode).
+    _reload_handle: Option<OverlayReloadHandle>,
 }
 
 impl GridRouteFilter {
     /// Create a grid route filter from parsed YAML config.
     ///
+    /// In **overlay mode** (`overlay_file` set), reads the overlay file,
+    /// builds an initial snapshot, and optionally spawns a background
+    /// watcher for hot reload.
+    ///
+    /// In **static mode** (`candidates` set), validates the inline
+    /// candidates and builds a static snapshot with no watcher.
+    ///
     /// # Errors
     ///
-    /// Returns [`FilterError`] if the candidate list is empty,
-    /// any name field is blank, or the model header is invalid.
+    /// Returns [`FilterError`] if:
+    /// - both `overlay_file` and `candidates` are set
+    /// - neither `overlay_file` nor `candidates` is set
+    /// - the overlay file cannot be read or parsed
+    /// - the candidate list is empty or invalid
+    /// - the model header is invalid
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: GridRouteConfig = parse_filter_config("grid_route", config)?;
-
-        descriptor::validate_local_site(&cfg.local_site)?;
         let model_header = descriptor::validate_model_header(&cfg.model_header)?;
-        let candidates = descriptor::validate_candidates(cfg.candidates)?;
+
+        if cfg.overlay_file.is_some() && cfg.candidates.is_some() {
+            return Err("grid: cannot set both overlay_file and candidates".into());
+        }
+
+        let (snapshot, reload_handle) = if let Some(path) = cfg.overlay_file {
+            let reload = cfg.reload.unwrap_or_default();
+            build_overlay_snapshot(path, &reload)?
+        } else if let Some(candidates_raw) = cfg.candidates {
+            if cfg.reload.is_some() {
+                return Err("grid: reload block is not valid with static candidates".into());
+            }
+            build_static_snapshot(candidates_raw, cfg.local_site)?
+        } else {
+            return Err("grid: either overlay_file or candidates must be set".into());
+        };
 
         Ok(Box::new(Self {
-            candidates,
-            local_site: Arc::from(cfg.local_site.as_str()),
+            snapshot,
             model_header,
+            _reload_handle: reload_handle,
         }))
     }
+}
+
+/// Return type for snapshot builders: shared snapshot + optional watcher.
+type SnapshotResult = Result<(Arc<ArcSwap<RouteSnapshot>>, Option<OverlayReloadHandle>), FilterError>;
+
+/// Build an overlay-backed snapshot with optional watcher.
+fn build_overlay_snapshot(path: PathBuf, reload: &ReloadConfig) -> SnapshotResult {
+    let content = overlay::read_overlay_bounded(&path)
+        .map_err(|e| FilterError::from(format!("grid: failed to read overlay file {}: {e}", path.display())))?;
+    let snap = RouteSnapshot::from_overlay(&content)?;
+    let shared = Arc::new(ArcSwap::from_pointee(snap));
+    let handle = reload
+        .enabled
+        .then(|| overlay::spawn_overlay_watcher(path, Arc::clone(&shared), reload.debounce_ms));
+    Ok((shared, handle))
+}
+
+/// Build a static snapshot from inline candidates.
+fn build_static_snapshot(candidates_raw: Vec<CandidateConfig>, local_site: Option<String>) -> SnapshotResult {
+    let local_site_str =
+        local_site.ok_or_else(|| FilterError::from("grid: local_site is required when candidates is set"))?;
+    descriptor::validate_local_site(&local_site_str)?;
+    let candidates = descriptor::validate_candidates(candidates_raw)?;
+    let snap = RouteSnapshot::from_static(candidates, Arc::from(local_site_str.as_str()));
+    Ok((Arc::new(ArcSwap::from_pointee(snap)), None))
 }
 
 #[async_trait]
@@ -158,6 +304,8 @@ impl HttpFilter for GridRouteFilter {
             return Ok(FilterAction::Continue);
         }
 
+        let snap = self.snapshot.load();
+
         let lookup = extract_lookup(ctx, &self.model_header);
 
         let (kind, name) = match lookup {
@@ -166,18 +314,18 @@ impl HttpFilter for GridRouteFilter {
             Lookup::Invalid => return Ok(FilterAction::Reject(Rejection::status(400))),
         };
 
-        if let Some(c) = select_candidate(&self.candidates, kind, &name, &self.local_site) {
+        if let Some(c) = select_candidate(&snap.candidates, kind, &name, &snap.local_site) {
             tracing::debug!(
                 kind = kind.as_str(),
                 name = %name,
                 site = &*c.site,
                 cluster = &*c.cluster,
                 fresh = c.fresh,
-                score = score_candidate(c, &self.local_site),
+                score = score_candidate(c, &snap.local_site),
                 "grid_route: selected"
             );
             ctx.cluster = Some(Arc::clone(&c.cluster));
-            record_route_decision(ctx, &self.local_site, c);
+            record_route_decision(ctx, &snap.local_site, c);
             Ok(FilterAction::Continue)
         } else {
             tracing::debug!(kind = kind.as_str(), name = %name, "grid_route: no candidate");
@@ -266,11 +414,13 @@ fn extract_model_lookup(ctx: &HttpFilterContext<'_>, model_header: &http::header
 // Candidate Selection
 // -----------------------------------------------------------------------------
 
-/// Select the best candidate by deterministic scoring.
+/// Select the best candidate by deterministic lexicographic scoring.
+///
+/// Priority: fresh > stale; local > remote within the same freshness
+/// class; first configured candidate wins on equal scores.
 ///
 /// Returns `None` when no candidate of the given `kind` matches
-/// `name`. When multiple candidates match, the highest-scored wins;
-/// ties are broken by config order (first configured wins).
+/// `name`.
 fn select_candidate<'a>(
     candidates: &'a [RouteCandidate],
     kind: CapabilityKind,
@@ -327,6 +477,7 @@ fn record_route_decision(ctx: &mut HttpFilterContext<'_>, local_site: &Arc<str>,
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(
+    clippy::cast_possible_truncation,
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::indexing_slicing,
@@ -863,6 +1014,270 @@ mod tests {
         );
     }
 
+    // ---- Overlay config validation ----
+
+    #[test]
+    fn from_config_overlay_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grid-config.json");
+        std::fs::write(
+            &path,
+            r#"{"local_site":"site-a","candidates":[{"kind":"inference_model","name":"llama","site":"site-a","cluster":"local","fresh":true}]}"#,
+        )
+        .unwrap();
+        let yaml = format!("overlay_file: {}\nreload:\n  enabled: false\n", path.display());
+        assert!(parse(&yaml).is_ok(), "overlay_file config should parse");
+    }
+
+    #[test]
+    fn from_config_overlay_file_missing() {
+        let yaml = "overlay_file: /nonexistent/grid-config.json\nreload:\n  enabled: false\n";
+        let err = parse_err(yaml);
+        assert!(
+            err.to_string().contains("failed to read"),
+            "missing overlay file should error: {err}"
+        );
+    }
+
+    #[test]
+    fn from_config_both_candidates_and_overlay() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grid-config.json");
+        std::fs::write(
+            &path,
+            r#"{"local_site":"a","candidates":[{"kind":"inference_model","name":"m","site":"s","cluster":"c","fresh":true}]}"#,
+        )
+        .unwrap();
+        let yaml = format!(
+            "overlay_file: {}\nlocal_site: site-a\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\n",
+            path.display()
+        );
+        let err = parse_err(&yaml);
+        assert!(
+            err.to_string().contains("cannot set both"),
+            "both overlay_file and candidates should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn from_config_neither_candidates_nor_overlay() {
+        let yaml = "model_header: X-Model\n";
+        let err = parse_err(yaml);
+        assert!(
+            err.to_string().contains("either overlay_file or candidates"),
+            "neither source should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn from_config_static_backwards_compat() {
+        let yaml = "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: llama\n    site: site-a\n    cluster: inf\n    fresh: true\n";
+        assert!(parse(yaml).is_ok(), "existing static config should still work");
+    }
+
+    #[tokio::test]
+    async fn on_request_after_snapshot_swap() {
+        let shared = Arc::new(ArcSwap::from_pointee(make_snapshot("cluster-v1")));
+        let filter = GridRouteFilter {
+            snapshot: Arc::clone(&shared),
+            model_header: http::header::HeaderName::from_static("x-model"),
+            _reload_handle: None,
+        };
+
+        assert_eq!(route_model(&filter, "llama").await.as_deref(), Some("cluster-v1"));
+
+        shared.store(Arc::new(make_snapshot("cluster-v2")));
+
+        assert_eq!(route_model(&filter, "llama").await.as_deref(), Some("cluster-v2"));
+    }
+
+    #[test]
+    fn reload_config_defaults() {
+        let cfg: ReloadConfig = serde_yaml::from_str("{}").unwrap();
+        assert!(cfg.enabled, "default enabled should be true");
+        assert_eq!(cfg.debounce_ms, overlay::DEFAULT_DEBOUNCE_MS, "default debounce_ms");
+    }
+
+    #[test]
+    fn reload_config_custom_debounce() {
+        let cfg: ReloadConfig = serde_yaml::from_str("debounce_ms: 1000\n").unwrap();
+        assert_eq!(cfg.debounce_ms, 1000);
+    }
+
+    #[test]
+    fn reload_disabled_no_watcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grid-config.json");
+        std::fs::write(
+            &path,
+            r#"{"local_site":"site-a","candidates":[{"kind":"inference_model","name":"m","site":"s","cluster":"c","fresh":true}]}"#,
+        )
+        .unwrap();
+        let yaml = format!("overlay_file: {}\nreload:\n  enabled: false\n", path.display());
+        let _filter = parse(&yaml).unwrap();
+    }
+
+    // ---- Static/dynamic config matrix (item 6) ----
+
+    #[test]
+    fn reload_block_with_static_candidates_rejected() {
+        let yaml = "local_site: site-a\nreload:\n  enabled: true\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\n";
+        let err = parse_err(yaml);
+        assert!(
+            err.to_string()
+                .contains("reload block is not valid with static candidates"),
+            "reload block with static candidates should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn reload_block_disabled_with_static_candidates_rejected() {
+        let yaml = "local_site: site-a\nreload:\n  enabled: false\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\n";
+        let err = parse_err(yaml);
+        assert!(
+            err.to_string()
+                .contains("reload block is not valid with static candidates"),
+            "reload block with static candidates should be rejected even if enabled=false: {err}"
+        );
+    }
+
+    #[test]
+    fn overlay_without_reload_block_uses_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grid-config.json");
+        std::fs::write(
+            &path,
+            r#"{"local_site":"a","candidates":[{"kind":"inference_model","name":"m","site":"s","cluster":"c","fresh":true}]}"#,
+        )
+        .unwrap();
+        let yaml = format!("overlay_file: {}\n", path.display());
+        assert!(parse(&yaml).is_ok(), "overlay without reload block should use defaults");
+    }
+
+    #[test]
+    fn overlay_with_reload_enabled_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grid-config.json");
+        std::fs::write(
+            &path,
+            r#"{"local_site":"a","candidates":[{"kind":"inference_model","name":"m","site":"s","cluster":"c","fresh":true}]}"#,
+        )
+        .unwrap();
+        let yaml = format!("overlay_file: {}\nreload:\n  enabled: false\n", path.display());
+        assert!(parse(&yaml).is_ok(), "overlay with reload disabled should work");
+    }
+
+    #[test]
+    fn overlay_with_reload_enabled_true() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grid-config.json");
+        std::fs::write(
+            &path,
+            r#"{"local_site":"a","candidates":[{"kind":"inference_model","name":"m","site":"s","cluster":"c","fresh":true}]}"#,
+        )
+        .unwrap();
+        let yaml = format!(
+            "overlay_file: {}\nreload:\n  enabled: true\n  debounce_ms: 100\n",
+            path.display()
+        );
+        assert!(parse(&yaml).is_ok(), "overlay with reload enabled should work");
+    }
+
+    #[test]
+    fn static_candidates_no_reload_block() {
+        let yaml = "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\n";
+        assert!(
+            parse(yaml).is_ok(),
+            "static candidates without reload block should work"
+        );
+    }
+
+    #[test]
+    fn overlay_with_custom_debounce() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grid-config.json");
+        std::fs::write(
+            &path,
+            r#"{"local_site":"a","candidates":[{"kind":"inference_model","name":"m","site":"s","cluster":"c","fresh":true}]}"#,
+        )
+        .unwrap();
+        let yaml = format!(
+            "overlay_file: {}\nreload:\n  enabled: false\n  debounce_ms: 2000\n",
+            path.display()
+        );
+        assert!(parse(&yaml).is_ok(), "overlay with custom debounce should work");
+    }
+
+    #[test]
+    fn neither_source_no_reload_rejected() {
+        let yaml = "model_header: X-Model\nreload:\n  enabled: true\n";
+        let err = parse_err(yaml);
+        assert!(
+            err.to_string().contains("either overlay_file or candidates"),
+            "no source + reload should still be rejected: {err}"
+        );
+    }
+
+    // ---- Selection contract (item 7) ----
+
+    #[tokio::test]
+    async fn reorder_after_reload_changes_selection() {
+        let shared = Arc::new(ArcSwap::from_pointee(make_two_candidate_snapshot(
+            "cluster-a",
+            "site-b",
+            "cluster-b",
+            "site-a",
+        )));
+        let filter = GridRouteFilter {
+            snapshot: Arc::clone(&shared),
+            model_header: http::header::HeaderName::from_static("x-model"),
+            _reload_handle: None,
+        };
+        assert_eq!(route_model(&filter, "llama").await.as_deref(), Some("cluster-b"));
+
+        shared.store(Arc::new(make_two_candidate_snapshot(
+            "cluster-c",
+            "site-c",
+            "cluster-a",
+            "site-a",
+        )));
+        assert_eq!(route_model(&filter, "llama").await.as_deref(), Some("cluster-a"));
+    }
+
+    #[tokio::test]
+    async fn stale_first_does_not_beat_fresh_later() {
+        let f = make_scored_filter(&[
+            ("inference_model", "llama", "site-a", "stale-local", false),
+            ("inference_model", "llama", "site-b", "fresh-remote", true),
+        ]);
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+
+        let _unused = f.on_request(&mut ctx).await.unwrap();
+        assert_eq!(
+            ctx.cluster.as_deref(),
+            Some("fresh-remote"),
+            "stale candidate listed first must NOT beat fresh candidate listed later"
+        );
+    }
+
+    // ---- Overlay bounded read at startup (item 3) ----
+
+    #[test]
+    fn from_config_overlay_oversized() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grid-config.json");
+        let content = vec![b'x'; (overlay::MAX_OVERLAY_SIZE + 1) as usize];
+        std::fs::write(&path, &content).unwrap();
+        let yaml = format!("overlay_file: {}\nreload:\n  enabled: false\n", path.display());
+        let err = parse_err(&yaml);
+        assert!(
+            err.to_string().contains("exceeds"),
+            "oversized overlay at startup should be rejected: {err}"
+        );
+    }
+
     // ---- Test utilities ----
 
     fn assert_no_route_metadata(ctx: &HttpFilterContext<'_>) {
@@ -915,5 +1330,51 @@ mod tests {
             .expect("String write is infallible");
         }
         parse(&yaml).unwrap()
+    }
+
+    fn make_two_candidate_snapshot(cluster1: &str, site1: &str, cluster2: &str, site2: &str) -> RouteSnapshot {
+        RouteSnapshot::from_static(
+            descriptor::validate_candidates(vec![
+                CandidateConfig {
+                    cluster: cluster1.to_owned(),
+                    fresh: true,
+                    kind: CapabilityKind::InferenceModel,
+                    name: "llama".to_owned(),
+                    site: site1.to_owned(),
+                },
+                CandidateConfig {
+                    cluster: cluster2.to_owned(),
+                    fresh: true,
+                    kind: CapabilityKind::InferenceModel,
+                    name: "llama".to_owned(),
+                    site: site2.to_owned(),
+                },
+            ])
+            .unwrap(),
+            Arc::from("site-a"),
+        )
+    }
+
+    fn make_snapshot(cluster: &str) -> RouteSnapshot {
+        RouteSnapshot::from_static(
+            descriptor::validate_candidates(vec![CandidateConfig {
+                cluster: cluster.to_owned(),
+                fresh: true,
+                kind: CapabilityKind::InferenceModel,
+                name: "llama".to_owned(),
+                site: "site-a".to_owned(),
+            }])
+            .unwrap(),
+            Arc::from("site-a"),
+        )
+    }
+
+    async fn route_model(filter: &GridRouteFilter, model: &str) -> Option<String> {
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers
+            .insert("X-Model", http::HeaderValue::from_str(model).unwrap());
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let _unused = filter.on_request(&mut ctx).await.unwrap();
+        ctx.cluster.as_deref().map(str::to_owned)
     }
 }

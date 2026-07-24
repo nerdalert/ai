@@ -53,7 +53,7 @@ see the [Praxis core filter reference][core-ref].
 
 | Filter | Description |
 |--------|-------------|
-| [`grid_route`](grid_route.md) | Selects an upstream cluster from a static site/capability descriptor by matching either an inference model name or MCP tool name. |
+| [`grid_route`](grid_route.md) | Selects an upstream cluster from a site/capability descriptor by matching either an inference model name or MCP tool name. |
 
 ### Guardrails
 
