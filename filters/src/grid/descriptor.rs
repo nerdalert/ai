@@ -54,6 +54,19 @@ impl CapabilityKind {
             Self::McpTool => "mcp_tool",
         }
     }
+
+    /// Parse a kind string from a Grid routing overlay document.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FilterError`] if the kind string is not recognised.
+    pub(crate) fn from_overlay_str(s: &str) -> Result<Self, FilterError> {
+        match s {
+            "inference_model" => Ok(Self::InferenceModel),
+            "mcp_tool" => Ok(Self::McpTool),
+            other => Err(format!("grid: unknown candidate kind: {other}").into()),
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------

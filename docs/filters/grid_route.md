@@ -3,29 +3,45 @@
 
 # `grid_route`
 
-Selects an upstream cluster from a static site/capability descriptor by matching either an inference model name or MCP tool name.
+Selects an upstream cluster from a site/capability descriptor by matching either an inference model name or MCP tool name.
 
 ## Configuration Notes
 
 This filter is registered by the AI proxy (not Praxis core) because it encodes AI/Grid-specific routing semantics: candidate freshness preference, local-site scoring, and MCP tool-call routing.  Praxis core provides the generic filter runtime; this filter adds the Grid candidate model on top.
 
+**Modes:** - **Static:** candidates are declared inline in the YAML config. - **Overlay:** candidates are loaded from a Grid `grid-config.json` file and hot-reloaded via [`ArcSwap`] when the file changes.
+
 **Behavior:** - If `ctx.cluster` is already set by an earlier filter, the selection is preserved and no metadata is written. - If no routing source is present, the filter returns `Continue` without routing. - If the model header or MCP tool name is blank, oversized, or invalid, the filter rejects with 400. - If a matching candidate is found, `ctx.cluster` is set and bounded route-decision metadata is written. - If no matching candidate is found, the filter rejects with 404.
 
-**Scoring:** candidates are scored deterministically.  Fresh candidates score 0; stale candidates receive -100.  Candidates on `local_site` receive +10.  Freshness is stronger than local preference.  First configured candidate wins on equal scores.
+**Scoring:** candidates are scored deterministically with lexicographic priority: fresh (0) beats stale (-100); local site (+10) beats remote within the same freshness class; first configured candidate wins on equal scores.  This is the `grid_route` filter's own scoring, not a recomputation of Grid's ranking.
 
 **Metadata:** on successful selection, bounded in-process filter metadata is written under the `grid.route.` namespace (`kind`, `name`, `site`, `cluster`, `local_site`).  No HTTP forwarding headers are written.  No request-time database, control-plane, or metrics lookups are performed.
 
 **MCP lookup:** if `mcp.method` filter metadata is set to `tools/call` and `mcp.name` is present, `mcp_tool` candidates are matched. Other MCP methods (`initialize`, `notifications/*`, etc.) skip routing.
 
+**Hot reload:** when `reload.enabled` is `true` (the default in overlay mode), the filter watches the overlay file's parent directory for filesystem events.  On change, the file is re-read, SHA-256 hashed (skipped if identical), parsed, validated, and atomically swapped in via `ArcSwap`.  In-flight requests continue using their previously loaded snapshot.  Unreadable or invalid files retain the previous snapshot.  Kubernetes `ConfigMap` projected volumes use atomic symlink replacement (`..data`), which the watcher detects as a Create/Modify event on the parent directory.  The overlay `ConfigMap` **must not** use `subPath` volume mounts — `subPath` bypasses the `..data` symlink mechanism and the watcher will not detect updates.
+
+**Scope:** overlay hot reload swaps the candidate list and `local_site` only.  It cannot add or remove `load_balancer` clusters, change cluster endpoints or TLS configuration, or inject credential values. Those changes require a full pipeline reload or pod restart. Every cluster name that may appear in any overlay version must already be configured in the downstream `load_balancer` filter. An overlay that references an unknown cluster will cause request-time failures, not a reload rejection.
+
+Supports two modes:
+
+**Static mode** — candidates and `local_site` are specified inline:
+
+**Overlay mode** — candidates are loaded from a Grid overlay file:
+
 ## Configuration
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `candidates` | CandidateConfig[] | yes | Static list of route candidates. |
+| `candidates` | CandidateConfig[] | no | Static list of route candidates (mutually exclusive with `overlay_file`). |
 | `candidates[].cluster` | string | yes | Cluster name to select when this candidate is chosen. |
 | `candidates[].fresh` | bool | no | Whether this candidate is fresh (default: `true`). |
 | `candidates[].kind` | `inference_model` \| `mcp_tool` | yes | Capability kind. |
 | `candidates[].name` | string | yes | Capability name (model name, tool name, or agent name). |
 | `candidates[].site` | string | yes | Site that owns this capability. |
-| `local_site` | string | yes | Name of the local site. |
+| `local_site` | string | no | Name of the local site (required in static mode, provided by overlay in overlay mode). |
 | `model_header` | string | no | Header name that carries the model name (default: `X-Model`). |
+| `overlay_file` | PathBuf | no | Path to a Grid overlay JSON file (`grid-config.json`). When set, candidates and `local_site` are read from the overlay instead of the YAML config. |
+| `reload` | ReloadConfig | no | Hot reload configuration for overlay mode. Only valid when `overlay_file` is set.  Providing a `reload:` block with static `candidates` is rejected — static candidates are immutable for the lifetime of the filter. |
+| `reload.enabled` | bool | no | Whether file watching is enabled (default: `true`). |
+| `reload.debounce_ms` | integer | no | Debounce window in milliseconds (default: 500). |

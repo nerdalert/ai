@@ -2929,18 +2929,23 @@ dependencies = [
 name = "praxis-ai-filters"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "base64",
  "bytes",
  "dashmap 6.2.1",
  "http",
+ "notify",
  "praxis-ai-apis",
  "praxis-proxy-core",
  "praxis-proxy-filter",
  "rand 0.10.2",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
  "yaml_serde",
 ]
@@ -3151,6 +3156,7 @@ dependencies = [
  "praxis-test-utils",
  "serde",
  "serde_json",
+ "tempfile",
  "yaml_serde",
 ]
 
