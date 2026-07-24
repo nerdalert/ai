@@ -7,15 +7,15 @@ Selects an upstream cluster from a site/capability descriptor by matching either
 
 ## Configuration Notes
 
-This filter is registered by the AI proxy (not Praxis core) because it encodes AI/Grid-specific routing semantics: candidate freshness preference, local-site scoring, and MCP tool-call routing.  Praxis core provides the generic filter runtime; this filter adds the Grid candidate model on top.
+This filter is registered by the AI proxy (not Praxis core) because it encodes AI/Grid-specific routing semantics: ordered candidate consumption, admission-state filtering, session affinity, and MCP tool-call routing. Praxis core provides the generic filter runtime; this filter adds the Grid candidate model on top.
 
 **Modes:** - **Static:** candidates are declared inline in the YAML config. - **Overlay:** candidates are loaded from a Grid `grid-config.json` file and hot-reloaded via [`ArcSwap`] when the file changes.
 
 **Behavior:** - If `ctx.cluster` is already set by an earlier filter, the selection is preserved and no metadata is written. - If no routing source is present, the filter returns `Continue` without routing. - If the model header or MCP tool name is blank, oversized, or invalid, the filter rejects with 400. - If a matching candidate is found, `ctx.cluster` is set and bounded route-decision metadata is written. - If no matching candidate is found, the filter rejects with 404.
 
-**Scoring:** candidates are scored deterministically with lexicographic priority: fresh (0) beats stale (-100); local site (+10) beats remote within the same freshness class; first configured candidate wins on equal scores.  This is the `grid_route` filter's own scoring, not a recomputation of Grid's ranking.
+**Selection:** the first matching candidate in the configured or Grid-rendered order wins after admission filtering.  Praxis AI does not recompute Grid geography, load, or score.  `admission_state=none` is never eligible.  `admission_state=existing_only` is only eligible through an already-bound session affinity entry.
 
-**Metadata:** on successful selection, bounded in-process filter metadata is written under the `grid.route.` namespace (`kind`, `name`, `site`, `cluster`, `local_site`).  No HTTP forwarding headers are written.  No request-time database, control-plane, or metrics lookups are performed.
+**Metadata:** on successful selection, bounded in-process filter metadata is written under the `grid.route.` namespace (`kind`, `name`, `site`, `cluster`, `local_site`, `stable_id`, `admission_state`, and optionally `rank`, `selection_tier`).  When session affinity is enabled, `session.bound`, `session.reused`, and `session.failover` keys are also written.  No HTTP forwarding headers are written.  No request-time database, control-plane, or metrics lookups are performed.
 
 **MCP lookup:** if `mcp.method` filter metadata is set to `tools/call` and `mcp.name` is present, `mcp_tool` candidates are matched. Other MCP methods (`initialize`, `notifications/*`, etc.) skip routing.
 
@@ -45,3 +45,8 @@ Supports two modes:
 | `reload` | ReloadConfig | no | Hot reload configuration for overlay mode. Only valid when `overlay_file` is set.  Providing a `reload:` block with static `candidates` is rejected — static candidates are immutable for the lifetime of the filter. |
 | `reload.enabled` | bool | no | Whether file watching is enabled (default: `true`). |
 | `reload.debounce_ms` | integer | no | Debounce window in milliseconds (default: 500). |
+| `session_affinity` | SessionAffinityConfig | no | Session affinity configuration (disabled by default). |
+| `session_affinity.cookie` | string | no | Name of a cookie to extract the session key from. |
+| `session_affinity.enabled` | bool | no | Whether session affinity is enabled (default: `false`). |
+| `session_affinity.header` | string | no | Header name to extract the session key from. |
+| `session_affinity.ttl_secs` | integer | no | Binding TTL in seconds (default: 3600, max: 86400). |
