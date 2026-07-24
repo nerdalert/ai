@@ -90,6 +90,7 @@ pub(crate) struct CandidateCredential {
     pub strategy: String,
 
     /// Reference to the Kubernetes Secret that contains the token.
+    #[serde(rename = "secretRef")]
     pub secret_ref: CredentialRef,
 }
 

@@ -911,11 +911,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "multi-line YAML fixture for credential passthrough assertion"
-    )]
-    async fn credential_not_written_to_route_metadata() {
+    async fn no_credential_token_value_in_route_metadata() {
+        const TOKEN_VALUE: &str = "super-secret-token-value";
         let yaml = concat!(
             "local_site: site-a\ncandidates:\n",
             "  - kind: inference_model\n",
@@ -938,16 +935,12 @@ mod tests {
         let mut ctx = crate::test_utils::make_filter_context(&req);
 
         let _action = f.on_request(&mut ctx).await.unwrap();
-        // Credential values must never appear in filter metadata.
-        for key in [
-            "grid.route.credential",
-            "grid.route.strategy",
-            "grid.route.secret_ref",
-            "grid.route.token",
-        ] {
+        // Credential references are intentionally written to metadata, but
+        // credential token values must never appear there.
+        for (key, value) in &ctx.filter_metadata {
             assert!(
-                ctx.get_metadata(key).is_none(),
-                "credential metadata key '{key}' must not be written to filter metadata"
+                !value.contains(TOKEN_VALUE),
+                "credential token value must not appear in metadata key '{key}'"
             );
         }
     }

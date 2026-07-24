@@ -29,9 +29,9 @@ This filter is registered by the AI proxy (not Praxis core) because it encodes A
 | `candidates[].site` | string | yes | Site that owns this capability. |
 | `candidates[].credential` | CandidateCredential | no | Optional credential reference for upstream authentication. When present, the upstream identified by this candidate requires a bearer token obtained from the referenced Kubernetes Secret.  The filter carries this reference for downstream use; it does not resolve the token. |
 | `candidates[].credential.strategy` | string | yes | Authentication strategy identifier.  Currently `"bearer_token"`. |
-| `candidates[].credential.secret_ref` | CredentialRef | yes | Reference to the Kubernetes Secret that contains the token. |
-| `candidates[].credential.secret_ref.name` | string | yes | Secret name. |
-| `candidates[].credential.secret_ref.namespace` | string | yes | Secret namespace. |
-| `candidates[].credential.secret_ref.key` | string | yes | Key within `Secret.data` that holds the credential bytes. |
+| `candidates[].credential.secretRef` | CredentialRef | yes | Reference to the Kubernetes Secret that contains the token. |
+| `candidates[].credential.secretRef.name` | string | yes | Secret name. |
+| `candidates[].credential.secretRef.namespace` | string | yes | Secret namespace. |
+| `candidates[].credential.secretRef.key` | string | yes | Key within `Secret.data` that holds the credential bytes. |
 | `local_site` | string | yes | Name of the local site. |
 | `model_header` | string | no | Header name that carries the model name (default: `X-Model`). |
