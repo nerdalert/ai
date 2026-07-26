@@ -46,6 +46,57 @@ pub(crate) enum CapabilityKind {
     McpTool,
 }
 
+// -----------------------------------------------------------------------------
+// AdmissionState
+// -----------------------------------------------------------------------------
+
+/// Grid-operator-assigned admission state for a routing candidate.
+///
+/// Controls whether a candidate accepts new sessions, existing
+/// sessions only, or is excluded from routing entirely.  Unknown
+/// values from the overlay default to [`NewAndExisting`] for
+/// forward compatibility.
+///
+/// [`NewAndExisting`]: AdmissionState::NewAndExisting
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum AdmissionState {
+    /// Accepts both new and existing sessions.
+    #[default]
+    NewAndExisting,
+
+    /// Accepts only existing sessions (bound via session affinity).
+    ExistingOnly,
+
+    /// Excluded from routing entirely.
+    Excluded,
+}
+
+impl AdmissionState {
+    /// Short string for metadata output.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::NewAndExisting => "new_and_existing",
+            Self::ExistingOnly => "existing_only",
+            Self::Excluded => "none",
+        }
+    }
+
+    /// Parse an admission state from a Grid overlay string.
+    ///
+    /// Unknown values default to [`NewAndExisting`] for forward
+    /// compatibility — the Grid operator may introduce new states
+    /// before AI is updated.
+    ///
+    /// [`NewAndExisting`]: AdmissionState::NewAndExisting
+    pub(crate) fn from_overlay_str(s: &str) -> Self {
+        match s {
+            "existing_only" => Self::ExistingOnly,
+            "none" => Self::Excluded,
+            _ => Self::NewAndExisting,
+        }
+    }
+}
+
 impl CapabilityKind {
     /// Short string for diagnostics and route metadata.
     pub(crate) fn as_str(self) -> &'static str {
@@ -118,13 +169,28 @@ fn default_fresh() -> bool {
 /// A validated route candidate ready for runtime matching.
 ///
 /// Created by [`validate_candidates`] from raw config entries.
-/// All string fields are bounded and non-blank.
+/// All string fields are bounded and non-blank.  Overlay-specific
+/// fields (`admission_state`, `rank`, `selection_tier`, `stable_id`)
+/// are populated by [`enrich_from_overlay`] after validation.
+///
+/// [`enrich_from_overlay`]: super::overlay::enrich_from_overlay
 #[derive(Debug)]
 pub(crate) struct RouteCandidate {
+    /// Grid-operator admission state.
+    pub admission_state: AdmissionState,
+
     /// Cluster name to select.
     pub cluster: Arc<str>,
 
-    /// Whether this candidate is fresh.
+    /// Whether this candidate is fresh. Preserved from Grid/static config for
+    /// compatibility; Grid owns freshness ordering.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "preserved from Grid/static config for compatibility; Grid owns freshness ordering"
+        )
+    )]
     pub fresh: bool,
 
     /// Capability kind.
@@ -133,13 +199,30 @@ pub(crate) struct RouteCandidate {
     /// Capability name.
     pub name: Arc<str>,
 
+    /// Grid-operator rank within the overlay (lower is better).
+    pub rank: Option<u32>,
+
+    /// Grid-operator locality tier (e.g. `"same_region"`).
+    pub selection_tier: Option<Arc<str>>,
+
     /// Site that owns this capability.
     pub site: Arc<str>,
+
+    /// Deterministic identifier for session affinity binding.
+    pub stable_id: Arc<str>,
 }
 
 // -----------------------------------------------------------------------------
 // Validation
 // -----------------------------------------------------------------------------
+
+/// Build a deterministic stable ID from candidate identity fields.
+///
+/// Used as a fallback when the Grid overlay does not provide an
+/// explicit `stable_id`.
+pub(crate) fn default_stable_id(kind: CapabilityKind, name: &str, site: &str, cluster: &str) -> Arc<str> {
+    Arc::from(format!("{}/{}/{}/{}", kind.as_str(), name, site, cluster))
+}
 
 /// Validate and build the candidate list from raw config entries.
 ///
@@ -169,12 +252,17 @@ pub(crate) fn validate_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<Route
             return Err(format!("grid: duplicate candidate '{}/{}/{}'", c.kind.as_str(), c.name, c.site).into());
         }
 
+        let stable_id = default_stable_id(c.kind, &c.name, &c.site, &c.cluster);
         candidates.push(RouteCandidate {
+            admission_state: AdmissionState::default(),
             cluster: Arc::from(c.cluster.as_str()),
             fresh: c.fresh,
             kind: c.kind,
             name: Arc::from(c.name.as_str()),
+            rank: None,
+            selection_tier: None,
             site: Arc::from(c.site.as_str()),
+            stable_id,
         });
     }
 

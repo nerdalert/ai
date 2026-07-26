@@ -14,37 +14,37 @@
 //! MCP metadata takes precedence over the model header to prevent a
 //! client-supplied model name from hijacking MCP routing.
 //!
-//! Candidate selection is deterministic and lexicographic:
-//! 1. **Freshness class** — fresh (0) beats stale (-100).
-//! 2. **Locality** — local site (+10) beats remote within the same freshness class.
-//! 3. **Config order** — first configured candidate wins on equal scores.
-//!
-//! This is the `grid_route` filter's own scoring; it is not a
-//! recomputation of Grid's ranking.  Grid-rendered order is used
-//! only as the tie-break within equal scores.
+//! Candidate selection is deterministic: the first matching candidate in
+//! the configured or Grid-rendered order wins after admission filtering.
+//! The filter does not recompute Grid geography, load, or scoring.
 //!
 //! No request-time metrics or control-plane lookups are performed.
 
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use dashmap::DashMap;
 use praxis_filter::{FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config};
 use serde::Deserialize;
 
 use super::{
-    descriptor::{self, CandidateConfig, CapabilityKind, RouteCandidate},
+    descriptor::{self, AdmissionState, CandidateConfig, CapabilityKind, RouteCandidate},
     overlay::{self, OverlayReloadHandle, RouteSnapshot},
 };
 
 /// Maximum length for header values read from the request.
 const MAX_HEADER_VALUE_LEN: usize = 256;
 
-/// Score penalty for stale candidates.
-const STALE_PENALTY: i32 = 100;
+/// Maximum session bindings before eviction (single-process scope).
+const MAX_BINDINGS: usize = 10_000;
 
-/// Score bonus for candidates on the local site.
-const LOCAL_PREFERENCE: i32 = 10;
+/// Maximum session affinity TTL in seconds (24 hours).
+const MAX_TTL_SECS: u64 = 86_400;
 
 // -----------------------------------------------------------------------------
 // Config
@@ -100,6 +100,9 @@ struct GridRouteConfig {
     /// block with static `candidates` is rejected — static candidates
     /// are immutable for the lifetime of the filter.
     reload: Option<ReloadConfig>,
+
+    /// Session affinity configuration (disabled by default).
+    session_affinity: Option<SessionAffinityConfig>,
 }
 
 /// Hot reload settings for overlay file watching.
@@ -124,6 +127,39 @@ impl Default for ReloadConfig {
     }
 }
 
+/// Session affinity configuration for binding sessions to stable candidates.
+///
+/// When enabled, the filter extracts a session key from the configured
+/// header or cookie and binds it to a candidate's `stable_id`.
+/// Subsequent requests with the same key reuse the bound candidate
+/// as long as it remains eligible and the binding has not expired.
+///
+/// **Scope:** bindings are stored in-memory (single-process).
+/// They are not shared across gateway instances and are lost on
+/// restart.  This is sufficient for the POC/demo scope.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionAffinityConfig {
+    /// Name of a cookie to extract the session key from.
+    cookie: Option<String>,
+
+    /// Whether session affinity is enabled (default: `false`).
+    #[serde(default)]
+    enabled: bool,
+
+    /// Header name to extract the session key from.
+    header: Option<String>,
+
+    /// Binding TTL in seconds (default: 3600, max: 86400).
+    #[serde(default = "default_ttl_secs")]
+    ttl_secs: u64,
+}
+
+/// Default session affinity TTL (1 hour).
+fn default_ttl_secs() -> u64 {
+    3600
+}
+
 /// Default model header name.
 fn default_model_header() -> String {
     "X-Model".to_owned()
@@ -140,6 +176,63 @@ fn default_debounce_ms() -> u64 {
 }
 
 // -----------------------------------------------------------------------------
+// Session Affinity (runtime)
+// -----------------------------------------------------------------------------
+
+/// In-memory session affinity state (single-process scope).
+struct SessionAffinity {
+    /// Session key → bound candidate mapping.
+    bindings: DashMap<String, Binding>,
+
+    /// Cookie name to extract the session key from.
+    cookie: Option<Arc<str>>,
+
+    /// Header name to extract the session key from.
+    header: Option<http::header::HeaderName>,
+
+    /// Binding time-to-live.
+    ttl: Duration,
+}
+
+impl std::fmt::Debug for SessionAffinity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionAffinity")
+            .field("bindings_len", &self.bindings.len())
+            .field("cookie", &self.cookie)
+            .field("header", &self.header)
+            .field("ttl", &self.ttl)
+            .finish()
+    }
+}
+
+/// A single session binding.
+struct Binding {
+    /// When this binding expires.
+    expires: Instant,
+
+    /// Stable ID of the bound candidate.
+    stable_id: Arc<str>,
+}
+
+/// Result of a session affinity lookup.
+enum AffinityOutcome<'a> {
+    /// No affinity configured.
+    Inactive,
+
+    /// Affinity enabled but no session key in request.
+    NoKey,
+
+    /// Session key found but no binding exists.
+    New,
+
+    /// Binding existed but candidate is gone, expired, or excluded.
+    Failover,
+
+    /// Bound candidate is still eligible.
+    Reused(&'a RouteCandidate),
+}
+
+// -----------------------------------------------------------------------------
 // GridRouteFilter
 // -----------------------------------------------------------------------------
 
@@ -147,9 +240,10 @@ fn default_debounce_ms() -> u64 {
 /// by matching either an inference model name or MCP tool name.
 ///
 /// This filter is registered by the AI proxy (not Praxis core) because it
-/// encodes AI/Grid-specific routing semantics: candidate freshness preference,
-/// local-site scoring, and MCP tool-call routing.  Praxis core provides the
-/// generic filter runtime; this filter adds the Grid candidate model on top.
+/// encodes AI/Grid-specific routing semantics: ordered candidate consumption,
+/// admission-state filtering, session affinity, and MCP tool-call routing.
+/// Praxis core provides the generic filter runtime; this filter adds the Grid
+/// candidate model on top.
 ///
 /// **Modes:**
 /// - **Static:** candidates are declared inline in the YAML config.
@@ -163,18 +257,19 @@ fn default_debounce_ms() -> u64 {
 /// - If a matching candidate is found, `ctx.cluster` is set and bounded route-decision metadata is written.
 /// - If no matching candidate is found, the filter rejects with 404.
 ///
-/// **Scoring:** candidates are scored deterministically with
-/// lexicographic priority: fresh (0) beats stale (-100); local
-/// site (+10) beats remote within the same freshness class; first
-/// configured candidate wins on equal scores.  This is the
-/// `grid_route` filter's own scoring, not a recomputation of
-/// Grid's ranking.
+/// **Selection:** the first matching candidate in the configured or
+/// Grid-rendered order wins after admission filtering.  Praxis AI does not
+/// recompute Grid geography, load, or score.  `admission_state=none` is never
+/// eligible.  `admission_state=existing_only` is only eligible through an
+/// already-bound session affinity entry.
 ///
 /// **Metadata:** on successful selection, bounded in-process filter
 /// metadata is written under the `grid.route.` namespace (`kind`, `name`,
-/// `site`, `cluster`, `local_site`).  No HTTP forwarding headers are
-/// written.  No request-time database, control-plane, or metrics
-/// lookups are performed.
+/// `site`, `cluster`, `local_site`, `stable_id`, `admission_state`, and
+/// optionally `rank`, `selection_tier`).  When session affinity is enabled,
+/// `session.bound`, `session.reused`, and `session.failover` keys are also
+/// written.  No HTTP forwarding headers are written.  No request-time database,
+/// control-plane, or metrics lookups are performed.
 ///
 /// **MCP lookup:** if `mcp.method` filter metadata is set to `tools/call`
 /// and `mcp.name` is present, `mcp_tool` candidates are matched.
@@ -203,12 +298,14 @@ fn default_debounce_ms() -> u64 {
 ///
 /// [`ArcSwap`]: arc_swap::ArcSwap
 pub struct GridRouteFilter {
-    /// Atomic snapshot of routing state (candidates + `local_site`).
-    snapshot: Arc<ArcSwap<RouteSnapshot>>,
     /// Header that carries the model name.
     model_header: http::header::HeaderName,
     /// Watcher handle for overlay hot reload (None in static mode).
     _reload_handle: Option<OverlayReloadHandle>,
+    /// In-memory session affinity (None when disabled).
+    session_affinity: Option<SessionAffinity>,
+    /// Atomic snapshot of routing state (candidates + `local_site`).
+    snapshot: Arc<ArcSwap<RouteSnapshot>>,
 }
 
 impl GridRouteFilter {
@@ -249,11 +346,46 @@ impl GridRouteFilter {
             return Err("grid: either overlay_file or candidates must be set".into());
         };
 
+        let session_affinity = build_session_affinity(cfg.session_affinity)?;
+
         Ok(Box::new(Self {
-            snapshot,
             model_header,
             _reload_handle: reload_handle,
+            session_affinity,
+            snapshot,
         }))
+    }
+
+    /// Core routing path: session affinity lookup, admission filtering,
+    /// candidate selection, metadata output.
+    fn select_and_route(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        snap: &RouteSnapshot,
+        kind: CapabilityKind,
+        name: &str,
+    ) -> FilterAction {
+        let session_key = self.session_affinity.as_ref().and_then(|a| extract_session_key(a, ctx));
+        let outcome = resolve_affinity(
+            self.session_affinity.as_ref(),
+            session_key.as_deref(),
+            &snap.candidates,
+            kind,
+            name,
+        );
+        if let AffinityOutcome::Reused(c) = outcome {
+            return apply_reused(ctx, &snap.local_site, c);
+        }
+        let failover = matches!(outcome, AffinityOutcome::Failover);
+        let Some(c) = select_admitted(&snap.candidates, kind, name) else {
+            tracing::debug!(kind = kind.as_str(), name = %name, "grid_route: no candidate");
+            return FilterAction::Reject(Rejection::status(404));
+        };
+        apply_route(ctx, &snap.local_site, c);
+        if let Some(aff) = &self.session_affinity {
+            record_session(aff, ctx, &c.stable_id, session_key.as_deref(), failover);
+        }
+        FilterAction::Continue
     }
 }
 
@@ -282,6 +414,44 @@ fn build_static_snapshot(candidates_raw: Vec<CandidateConfig>, local_site: Optio
     Ok((Arc::new(ArcSwap::from_pointee(snap)), None))
 }
 
+/// Build the runtime [`SessionAffinity`] from config, if enabled.
+fn build_session_affinity(config: Option<SessionAffinityConfig>) -> Result<Option<SessionAffinity>, FilterError> {
+    let Some(cfg) = config else {
+        return Ok(None);
+    };
+    if !cfg.enabled {
+        return Ok(None);
+    }
+    validate_session_affinity_config(&cfg)?;
+    let header = cfg
+        .header
+        .as_deref()
+        .filter(|h| !h.trim().is_empty())
+        .map(str::parse::<http::header::HeaderName>)
+        .transpose()
+        .map_err(|e| -> FilterError { format!("grid: invalid session_affinity.header: {e}").into() })?;
+    let cookie = cfg.cookie.as_deref().filter(|c| !c.trim().is_empty()).map(Arc::from);
+    Ok(Some(SessionAffinity {
+        bindings: DashMap::new(),
+        cookie,
+        header,
+        ttl: Duration::from_secs(cfg.ttl_secs),
+    }))
+}
+
+/// Validate session affinity config constraints.
+fn validate_session_affinity_config(cfg: &SessionAffinityConfig) -> Result<(), FilterError> {
+    let has_header = cfg.header.as_deref().is_some_and(|h| !h.trim().is_empty());
+    let has_cookie = cfg.cookie.as_deref().is_some_and(|c| !c.trim().is_empty());
+    if !has_header && !has_cookie {
+        return Err("grid: session_affinity requires at least one of header or cookie".into());
+    }
+    if cfg.ttl_secs == 0 || cfg.ttl_secs > MAX_TTL_SECS {
+        return Err(format!("grid: session_affinity.ttl_secs must be 1-{MAX_TTL_SECS}").into());
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl HttpFilter for GridRouteFilter {
     fn name(&self) -> &'static str {
@@ -305,7 +475,6 @@ impl HttpFilter for GridRouteFilter {
         }
 
         let snap = self.snapshot.load();
-
         let lookup = extract_lookup(ctx, &self.model_header);
 
         let (kind, name) = match lookup {
@@ -314,24 +483,43 @@ impl HttpFilter for GridRouteFilter {
             Lookup::Invalid => return Ok(FilterAction::Reject(Rejection::status(400))),
         };
 
-        if let Some(c) = select_candidate(&snap.candidates, kind, &name, &snap.local_site) {
-            tracing::debug!(
-                kind = kind.as_str(),
-                name = %name,
-                site = &*c.site,
-                cluster = &*c.cluster,
-                fresh = c.fresh,
-                score = score_candidate(c, &snap.local_site),
-                "grid_route: selected"
-            );
-            ctx.cluster = Some(Arc::clone(&c.cluster));
-            record_route_decision(ctx, &snap.local_site, c);
-            Ok(FilterAction::Continue)
-        } else {
-            tracing::debug!(kind = kind.as_str(), name = %name, "grid_route: no candidate");
-            Ok(FilterAction::Reject(Rejection::status(404)))
-        }
+        Ok(self.select_and_route(ctx, &snap, kind, &name))
     }
+}
+
+/// Apply a reused (session-affinity-bound) candidate.
+fn apply_reused(ctx: &mut HttpFilterContext<'_>, local_site: &Arc<str>, candidate: &RouteCandidate) -> FilterAction {
+    ctx.cluster = Some(Arc::clone(&candidate.cluster));
+    record_route_decision(ctx, local_site, candidate);
+    ctx.set_metadata("grid.route.session.bound", "true");
+    ctx.set_metadata("grid.route.session.reused", "true");
+    ctx.set_metadata("grid.route.session.failover", "false");
+    FilterAction::Continue
+}
+
+/// Set cluster and record route decision metadata.
+fn apply_route(ctx: &mut HttpFilterContext<'_>, local_site: &Arc<str>, candidate: &RouteCandidate) {
+    ctx.cluster = Some(Arc::clone(&candidate.cluster));
+    record_route_decision(ctx, local_site, candidate);
+}
+
+/// Record session-affinity metadata and store a binding.
+fn record_session(
+    affinity: &SessionAffinity,
+    ctx: &mut HttpFilterContext<'_>,
+    stable_id: &Arc<str>,
+    session_key: Option<&str>,
+    failover: bool,
+) {
+    let bound = if let Some(key) = session_key {
+        store_binding(affinity, key, stable_id);
+        true
+    } else {
+        false
+    };
+    ctx.set_metadata("grid.route.session.bound", if bound { "true" } else { "false" });
+    ctx.set_metadata("grid.route.session.reused", "false");
+    ctx.set_metadata("grid.route.session.failover", if failover { "true" } else { "false" });
 }
 
 // -----------------------------------------------------------------------------
@@ -411,46 +599,150 @@ fn extract_model_lookup(ctx: &HttpFilterContext<'_>, model_header: &http::header
 }
 
 // -----------------------------------------------------------------------------
-// Candidate Selection
+// Session Affinity Helpers
 // -----------------------------------------------------------------------------
 
-/// Select the best candidate by deterministic lexicographic scoring.
+/// Extract a session key from the request using the configured sources.
 ///
-/// Priority: fresh > stale; local > remote within the same freshness
-/// class; first configured candidate wins on equal scores.
-///
-/// Returns `None` when no candidate of the given `kind` matches
-/// `name`.
-fn select_candidate<'a>(
+/// Checks the header first, then falls back to the cookie.
+fn extract_session_key(affinity: &SessionAffinity, ctx: &HttpFilterContext<'_>) -> Option<String> {
+    if let Some(header_name) = &affinity.header
+        && let Some(v) = ctx.request.headers.get(header_name)
+        && let Ok(s) = v.to_str()
+    {
+        let s = s.trim();
+        if !s.is_empty() && s.len() <= MAX_HEADER_VALUE_LEN {
+            return Some(s.to_owned());
+        }
+    }
+    affinity
+        .cookie
+        .as_deref()
+        .and_then(|name| extract_cookie_value(ctx, name))
+}
+
+/// Extract a named cookie value from the `Cookie` header.
+fn extract_cookie_value(ctx: &HttpFilterContext<'_>, name: &str) -> Option<String> {
+    let cookie_hdr = ctx.request.headers.get(http::header::COOKIE)?;
+    let cookie_str = cookie_hdr.to_str().ok()?;
+    let prefix = format!("{name}=");
+    for part in cookie_str.split(';') {
+        let trimmed = part.trim();
+        if let Some(value) = trimmed.strip_prefix(&prefix)
+            && !value.is_empty()
+            && value.len() <= MAX_HEADER_VALUE_LEN
+        {
+            return Some(value.to_owned());
+        }
+    }
+    None
+}
+
+/// Resolve session affinity state for the current request.
+fn resolve_affinity<'a>(
+    affinity: Option<&SessionAffinity>,
+    session_key: Option<&str>,
     candidates: &'a [RouteCandidate],
     kind: CapabilityKind,
     name: &str,
-    local_site: &str,
+) -> AffinityOutcome<'a> {
+    let Some(aff) = affinity else {
+        return AffinityOutcome::Inactive;
+    };
+    let Some(key) = session_key else {
+        return AffinityOutcome::NoKey;
+    };
+    lookup_binding(aff, key, candidates, kind, name)
+}
+
+/// Look up an existing binding and find its candidate.
+fn lookup_binding<'a>(
+    affinity: &SessionAffinity,
+    key: &str,
+    candidates: &'a [RouteCandidate],
+    kind: CapabilityKind,
+    name: &str,
+) -> AffinityOutcome<'a> {
+    let Some(binding) = affinity.bindings.get(key) else {
+        return AffinityOutcome::New;
+    };
+    if binding.expires < Instant::now() {
+        drop(binding);
+        affinity.bindings.remove(key);
+        return AffinityOutcome::New;
+    }
+    let stable = Arc::clone(&binding.stable_id);
+    drop(binding);
+    for c in candidates {
+        if c.kind != kind || &*c.name != name || *c.stable_id != *stable {
+            continue;
+        }
+        if c.admission_state == AdmissionState::Excluded {
+            return AffinityOutcome::Failover;
+        }
+        return AffinityOutcome::Reused(c);
+    }
+    AffinityOutcome::Failover
+}
+
+/// Store or update a session binding.
+fn store_binding(affinity: &SessionAffinity, key: &str, stable_id: &Arc<str>) {
+    if affinity.bindings.len() >= MAX_BINDINGS {
+        evict_expired(affinity);
+    }
+    if affinity.bindings.len() >= MAX_BINDINGS {
+        tracing::warn!("grid_route: session binding table full; routing without binding");
+        return;
+    }
+    affinity.bindings.insert(
+        key.to_owned(),
+        Binding {
+            expires: Instant::now() + affinity.ttl,
+            stable_id: Arc::clone(stable_id),
+        },
+    );
+}
+
+/// Remove all expired bindings.
+fn evict_expired(affinity: &SessionAffinity) {
+    let now = Instant::now();
+    affinity.bindings.retain(|_, b| b.expires > now);
+}
+
+// -----------------------------------------------------------------------------
+// Candidate Selection
+// -----------------------------------------------------------------------------
+
+/// Select the first candidate admitted for a new request.
+///
+/// Always excludes [`Excluded`] candidates.  When `is_new_session`
+/// is `true`, also excludes [`ExistingOnly`] candidates.
+///
+/// Praxis AI intentionally preserves the configured or Grid-rendered
+/// candidate order. Grid owns geography, load-aware ordering, and rank.
+///
+/// [`Excluded`]: AdmissionState::Excluded
+/// [`ExistingOnly`]: AdmissionState::ExistingOnly
+fn select_admitted<'a>(
+    candidates: &'a [RouteCandidate],
+    kind: CapabilityKind,
+    name: &str,
 ) -> Option<&'a RouteCandidate> {
-    let mut best: Option<(i32, &RouteCandidate)> = None;
     for c in candidates {
         if c.kind != kind || &*c.name != name {
             continue;
         }
-        let s = score_candidate(c, local_site);
-        match best {
-            Some((best_score, _)) if s <= best_score => {},
-            _ => best = Some((s, c)),
+        if !is_admitted_for_new_request(c.admission_state) {
+            continue;
         }
+        return Some(c);
     }
-    best.map(|(_, c)| c)
+    None
 }
 
-/// Deterministic score for a candidate. Higher is better.
-fn score_candidate(candidate: &RouteCandidate, local_site: &str) -> i32 {
-    let mut s: i32 = 0;
-    if !candidate.fresh {
-        s -= STALE_PENALTY;
-    }
-    if *candidate.site == *local_site {
-        s += LOCAL_PREFERENCE;
-    }
-    s
+/// Whether a candidate passes admission filtering.
+fn is_admitted_for_new_request(state: AdmissionState) -> bool {
+    state == AdmissionState::NewAndExisting
 }
 
 // -----------------------------------------------------------------------------
@@ -463,11 +755,19 @@ fn score_candidate(candidate: &RouteCandidate, local_site: &str) -> i32 {
 /// existing `set_metadata` limits.  No HTTP forwarding headers are
 /// written by this function.
 fn record_route_decision(ctx: &mut HttpFilterContext<'_>, local_site: &Arc<str>, candidate: &RouteCandidate) {
+    ctx.set_metadata("grid.route.admission_state", candidate.admission_state.as_str());
+    ctx.set_metadata("grid.route.cluster", &*candidate.cluster);
     ctx.set_metadata("grid.route.kind", candidate.kind.as_str());
+    ctx.set_metadata("grid.route.local_site", &**local_site);
     ctx.set_metadata("grid.route.name", &*candidate.name);
     ctx.set_metadata("grid.route.site", &*candidate.site);
-    ctx.set_metadata("grid.route.cluster", &*candidate.cluster);
-    ctx.set_metadata("grid.route.local_site", &**local_site);
+    ctx.set_metadata("grid.route.stable_id", &*candidate.stable_id);
+    if let Some(rank) = candidate.rank {
+        ctx.set_metadata("grid.route.rank", rank.to_string());
+    }
+    if let Some(tier) = &candidate.selection_tier {
+        ctx.set_metadata("grid.route.selection_tier", &**tier);
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -797,8 +1097,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mcp_tool_applies_scoring() {
-        let f = make_scored_filter(&[
+    async fn mcp_tool_uses_configured_order() {
+        let f = make_filter_with_fresh(&[
             ("mcp_tool", "weather", "site-b", "remote-mcp", true),
             ("mcp_tool", "weather", "site-a", "local-mcp", true),
         ]);
@@ -808,7 +1108,11 @@ mod tests {
         ctx.set_metadata("mcp.name", "weather");
 
         let _unused = f.on_request(&mut ctx).await.unwrap();
-        assert_eq!(ctx.cluster.as_deref(), Some("local-mcp"), "local MCP tool should win");
+        assert_eq!(
+            ctx.cluster.as_deref(),
+            Some("remote-mcp"),
+            "first matching MCP tool candidate should win"
+        );
     }
 
     // ---- Cluster preservation ----
@@ -831,10 +1135,10 @@ mod tests {
         assert_no_route_metadata(&ctx);
     }
 
-    // ---- Scoring ----
+    // ---- Ordered selection ----
 
     #[tokio::test]
-    async fn local_fresh_beats_remote_fresh() {
+    async fn configured_order_beats_locality() {
         let f = make_filter(&[
             ("inference_model", "llama", "site-b", "remote-inf"),
             ("inference_model", "llama", "site-a", "local-inf"),
@@ -846,13 +1150,13 @@ mod tests {
         let _unused = f.on_request(&mut ctx).await.unwrap();
         assert_eq!(
             ctx.cluster.as_deref(),
-            Some("local-inf"),
-            "local candidate should win over remote"
+            Some("remote-inf"),
+            "first configured candidate must win; grid_route does not recompute locality"
         );
     }
 
     #[tokio::test]
-    async fn config_order_breaks_equal_score_ties() {
+    async fn configured_order_selects_first_matching_candidate() {
         let f = make_filter(&[
             ("inference_model", "llama", "site-b", "first-remote"),
             ("inference_model", "llama", "site-c", "second-remote"),
@@ -865,13 +1169,13 @@ mod tests {
         assert_eq!(
             ctx.cluster.as_deref(),
             Some("first-remote"),
-            "first configured candidate wins on equal score"
+            "first configured candidate wins"
         );
     }
 
     #[tokio::test]
-    async fn fresh_remote_beats_stale_remote() {
-        let f = make_scored_filter(&[
+    async fn configured_order_preserves_stale_candidate_position() {
+        let f = make_filter_with_fresh(&[
             ("inference_model", "llama", "site-b", "stale-remote", false),
             ("inference_model", "llama", "site-c", "fresh-remote", true),
         ]);
@@ -882,14 +1186,14 @@ mod tests {
         let _unused = f.on_request(&mut ctx).await.unwrap();
         assert_eq!(
             ctx.cluster.as_deref(),
-            Some("fresh-remote"),
-            "fresh candidate should beat stale"
+            Some("stale-remote"),
+            "freshness must not reorder candidates; Grid owns overlay ordering"
         );
     }
 
     #[tokio::test]
-    async fn fresh_remote_beats_stale_local() {
-        let f = make_scored_filter(&[
+    async fn configured_order_beats_freshness_and_locality() {
+        let f = make_filter_with_fresh(&[
             ("inference_model", "llama", "site-a", "stale-local", false),
             ("inference_model", "llama", "site-b", "fresh-remote", true),
         ]);
@@ -900,14 +1204,14 @@ mod tests {
         let _unused = f.on_request(&mut ctx).await.unwrap();
         assert_eq!(
             ctx.cluster.as_deref(),
-            Some("fresh-remote"),
-            "fresh remote beats stale local"
+            Some("stale-local"),
+            "grid_route must preserve Grid/config order after admission filtering"
         );
     }
 
     #[tokio::test]
-    async fn stale_local_beats_stale_remote() {
-        let f = make_scored_filter(&[
+    async fn configured_order_beats_stale_locality() {
+        let f = make_filter_with_fresh(&[
             ("inference_model", "llama", "site-b", "stale-remote", false),
             ("inference_model", "llama", "site-a", "stale-local", false),
         ]);
@@ -918,15 +1222,15 @@ mod tests {
         let _unused = f.on_request(&mut ctx).await.unwrap();
         assert_eq!(
             ctx.cluster.as_deref(),
-            Some("stale-local"),
-            "stale local beats stale remote"
+            Some("stale-remote"),
+            "locality must not reorder candidates"
         );
     }
 
     // ---- Route metadata ----
 
     #[tokio::test]
-    async fn scored_route_metadata_reflects_winner() {
+    async fn route_metadata_reflects_ordered_winner() {
         let f = make_filter(&[
             ("inference_model", "llama", "site-b", "remote-inf"),
             ("inference_model", "llama", "site-a", "local-inf"),
@@ -936,10 +1240,10 @@ mod tests {
         let mut ctx = crate::test_utils::make_filter_context(&req);
 
         let _unused = f.on_request(&mut ctx).await.unwrap();
-        assert_eq!(ctx.get_metadata("grid.route.cluster"), Some("local-inf"));
+        assert_eq!(ctx.get_metadata("grid.route.cluster"), Some("remote-inf"));
         assert_eq!(ctx.get_metadata("grid.route.kind"), Some("inference_model"));
         assert_eq!(ctx.get_metadata("grid.route.name"), Some("llama"));
-        assert_eq!(ctx.get_metadata("grid.route.site"), Some("site-a"));
+        assert_eq!(ctx.get_metadata("grid.route.site"), Some("site-b"));
         assert_eq!(ctx.get_metadata("grid.route.local_site"), Some("site-a"));
     }
 
@@ -1079,9 +1383,10 @@ mod tests {
     async fn on_request_after_snapshot_swap() {
         let shared = Arc::new(ArcSwap::from_pointee(make_snapshot("cluster-v1")));
         let filter = GridRouteFilter {
-            snapshot: Arc::clone(&shared),
             model_header: http::header::HeaderName::from_static("x-model"),
             _reload_handle: None,
+            session_affinity: None,
+            snapshot: Arc::clone(&shared),
         };
 
         assert_eq!(route_model(&filter, "llama").await.as_deref(), Some("cluster-v1"));
@@ -1229,11 +1534,12 @@ mod tests {
             "site-a",
         )));
         let filter = GridRouteFilter {
-            snapshot: Arc::clone(&shared),
             model_header: http::header::HeaderName::from_static("x-model"),
             _reload_handle: None,
+            session_affinity: None,
+            snapshot: Arc::clone(&shared),
         };
-        assert_eq!(route_model(&filter, "llama").await.as_deref(), Some("cluster-b"));
+        assert_eq!(route_model(&filter, "llama").await.as_deref(), Some("cluster-a"));
 
         shared.store(Arc::new(make_two_candidate_snapshot(
             "cluster-c",
@@ -1241,12 +1547,12 @@ mod tests {
             "cluster-a",
             "site-a",
         )));
-        assert_eq!(route_model(&filter, "llama").await.as_deref(), Some("cluster-a"));
+        assert_eq!(route_model(&filter, "llama").await.as_deref(), Some("cluster-c"));
     }
 
     #[tokio::test]
-    async fn stale_first_does_not_beat_fresh_later() {
-        let f = make_scored_filter(&[
+    async fn stale_first_preserved_when_grid_orders_it_first() {
+        let f = make_filter_with_fresh(&[
             ("inference_model", "llama", "site-a", "stale-local", false),
             ("inference_model", "llama", "site-b", "fresh-remote", true),
         ]);
@@ -1257,8 +1563,8 @@ mod tests {
         let _unused = f.on_request(&mut ctx).await.unwrap();
         assert_eq!(
             ctx.cluster.as_deref(),
-            Some("fresh-remote"),
-            "stale candidate listed first must NOT beat fresh candidate listed later"
+            Some("stale-local"),
+            "grid_route must preserve input order; Grid is responsible for freshness ordering"
         );
     }
 
@@ -1278,29 +1584,481 @@ mod tests {
         );
     }
 
+    // ---- Admission filtering ----
+
+    #[tokio::test]
+    async fn excluded_always_skipped() {
+        let snap = make_overlay_snapshot(&[("new_and_existing", "c-a"), ("none", "c-b")]);
+        let filter = make_affinity_filter(Arc::new(ArcSwap::from_pointee(snap)), None);
+        assert_eq!(route_model(&filter, "llama").await.as_deref(), Some("c-a"));
+    }
+
+    #[tokio::test]
+    async fn new_session_skips_existing_only() {
+        let snap = make_overlay_snapshot(&[("existing_only", "c-a"), ("new_and_existing", "c-b")]);
+        let filter = make_affinity_filter(Arc::new(ArcSwap::from_pointee(snap)), Some(make_test_affinity()));
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
+        req.headers
+            .insert("x-session-id", http::HeaderValue::from_static("new-key"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let _unused = filter.on_request(&mut ctx).await.unwrap();
+        assert_eq!(
+            ctx.cluster.as_deref(),
+            Some("c-b"),
+            "new session must skip existing_only"
+        );
+    }
+
+    #[tokio::test]
+    async fn affinity_disabled_skips_existing_only() {
+        let snap = make_overlay_snapshot(&[("existing_only", "c-a"), ("new_and_existing", "c-b")]);
+        let filter = make_affinity_filter(Arc::new(ArcSwap::from_pointee(snap)), None);
+        assert_eq!(
+            route_model(&filter, "llama").await.as_deref(),
+            Some("c-b"),
+            "without affinity every request is a new request and must skip existing_only"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_session_key_skips_existing_only() {
+        let snap = make_overlay_snapshot(&[("existing_only", "c-a"), ("new_and_existing", "c-b")]);
+        let filter = make_affinity_filter(Arc::new(ArcSwap::from_pointee(snap)), Some(make_test_affinity()));
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let _unused = filter.on_request(&mut ctx).await.unwrap();
+        assert_eq!(
+            ctx.cluster.as_deref(),
+            Some("c-b"),
+            "affinity-enabled request without a key must skip existing_only"
+        );
+        assert_eq!(ctx.get_metadata("grid.route.session.bound"), Some("false"));
+    }
+
+    #[tokio::test]
+    async fn existing_session_can_use_existing_only() {
+        let snap = make_overlay_snapshot(&[("existing_only", "c-drain"), ("new_and_existing", "c-new")]);
+        let shared = Arc::new(ArcSwap::from_pointee(snap));
+        let affinity = make_test_affinity();
+        affinity.bindings.insert(
+            "returning-user".to_owned(),
+            Binding {
+                expires: Instant::now() + Duration::from_secs(300),
+                stable_id: Arc::from("inference_model/llama/s/c-drain"),
+            },
+        );
+        let filter = make_affinity_filter(shared, Some(affinity));
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
+        req.headers
+            .insert("x-session-id", http::HeaderValue::from_static("returning-user"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let _unused = filter.on_request(&mut ctx).await.unwrap();
+        assert_eq!(
+            ctx.cluster.as_deref(),
+            Some("c-drain"),
+            "existing session reuses bound candidate"
+        );
+        assert_eq!(ctx.get_metadata("grid.route.session.bound"), Some("true"));
+        assert_eq!(ctx.get_metadata("grid.route.session.reused"), Some("true"));
+        assert_eq!(ctx.get_metadata("grid.route.session.failover"), Some("false"));
+    }
+
+    #[tokio::test]
+    async fn failover_skips_existing_only_candidate() {
+        let snap = make_overlay_snapshot(&[("new_and_existing", "c-old")]);
+        let shared = Arc::new(ArcSwap::from_pointee(snap));
+        let affinity = make_test_affinity();
+        affinity.bindings.insert(
+            "sess-1".to_owned(),
+            Binding {
+                expires: Instant::now() + Duration::from_secs(300),
+                stable_id: Arc::from("inference_model/llama/s/c-old"),
+            },
+        );
+        let filter = make_affinity_filter(Arc::clone(&shared), Some(affinity));
+
+        let snap_v2 = make_overlay_snapshot(&[("existing_only", "c-drain"), ("new_and_existing", "c-new")]);
+        shared.store(Arc::new(snap_v2));
+
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
+        req.headers
+            .insert("x-session-id", http::HeaderValue::from_static("sess-1"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let _unused = filter.on_request(&mut ctx).await.unwrap();
+        assert_eq!(
+            ctx.cluster.as_deref(),
+            Some("c-new"),
+            "failover must choose a new_and_existing candidate, not another existing_only candidate"
+        );
+        assert_eq!(ctx.get_metadata("grid.route.session.bound"), Some("true"));
+        assert_eq!(ctx.get_metadata("grid.route.session.reused"), Some("false"));
+        assert_eq!(ctx.get_metadata("grid.route.session.failover"), Some("true"));
+    }
+
+    #[tokio::test]
+    async fn no_new_and_existing_returns_404() {
+        let snap = make_overlay_snapshot(&[("existing_only", "c-a"), ("none", "c-b")]);
+        let filter = make_affinity_filter(Arc::new(ArcSwap::from_pointee(snap)), Some(make_test_affinity()));
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
+        req.headers
+            .insert("x-session-id", http::HeaderValue::from_static("brand-new"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(
+            matches!(action, FilterAction::Reject(r) if r.status == 404),
+            "new session with only existing_only/excluded must get 404"
+        );
+    }
+
+    // ---- Session affinity ----
+
+    #[tokio::test]
+    async fn first_request_creates_binding() {
+        let snap = make_overlay_snapshot(&[("new_and_existing", "c-a")]);
+        let shared = Arc::new(ArcSwap::from_pointee(snap));
+        let affinity = make_test_affinity();
+        let filter = make_affinity_filter(Arc::clone(&shared), Some(affinity));
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
+        req.headers
+            .insert("x-session-id", http::HeaderValue::from_static("sess-1"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let _unused = filter.on_request(&mut ctx).await.unwrap();
+        assert_eq!(ctx.cluster.as_deref(), Some("c-a"));
+        assert_eq!(ctx.get_metadata("grid.route.session.bound"), Some("true"));
+        assert_eq!(ctx.get_metadata("grid.route.session.reused"), Some("false"));
+        assert!(
+            filter
+                .session_affinity
+                .as_ref()
+                .unwrap()
+                .bindings
+                .contains_key("sess-1"),
+            "binding should be created"
+        );
+    }
+
+    #[tokio::test]
+    async fn second_request_reuses_stable_id() {
+        let snap = make_overlay_snapshot(&[("new_and_existing", "c-a"), ("new_and_existing", "c-b")]);
+        let shared = Arc::new(ArcSwap::from_pointee(snap));
+        let affinity = make_test_affinity();
+        affinity.bindings.insert(
+            "sess-1".to_owned(),
+            Binding {
+                expires: Instant::now() + Duration::from_secs(300),
+                stable_id: Arc::from("inference_model/llama/s/c-a"),
+            },
+        );
+        let filter = make_affinity_filter(shared, Some(affinity));
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
+        req.headers
+            .insert("x-session-id", http::HeaderValue::from_static("sess-1"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let _unused = filter.on_request(&mut ctx).await.unwrap();
+        assert_eq!(ctx.cluster.as_deref(), Some("c-a"));
+        assert_eq!(ctx.get_metadata("grid.route.session.reused"), Some("true"));
+    }
+
+    #[tokio::test]
+    async fn different_session_key_independent() {
+        let snap = make_overlay_snapshot(&[("new_and_existing", "c-a")]);
+        let shared = Arc::new(ArcSwap::from_pointee(snap));
+        let affinity = make_test_affinity();
+        let filter = make_affinity_filter(shared, Some(affinity));
+
+        for key in &["sess-a", "sess-b"] {
+            let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+            req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
+            req.headers
+                .insert("x-session-id", http::HeaderValue::from_str(key).unwrap());
+            let mut ctx = crate::test_utils::make_filter_context(&req);
+            let _unused = filter.on_request(&mut ctx).await.unwrap();
+        }
+        let aff = filter.session_affinity.as_ref().unwrap();
+        assert!(aff.bindings.contains_key("sess-a"), "sess-a should be bound");
+        assert!(aff.bindings.contains_key("sess-b"), "sess-b should be bound");
+    }
+
+    #[tokio::test]
+    async fn expired_binding_treated_as_new() {
+        let snap = make_overlay_snapshot(&[("new_and_existing", "c-a")]);
+        let shared = Arc::new(ArcSwap::from_pointee(snap));
+        let affinity = make_test_affinity();
+        affinity.bindings.insert(
+            "expired-sess".to_owned(),
+            Binding {
+                expires: Instant::now() - Duration::from_secs(1),
+                stable_id: Arc::from("old-id"),
+            },
+        );
+        let filter = make_affinity_filter(shared, Some(affinity));
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
+        req.headers
+            .insert("x-session-id", http::HeaderValue::from_static("expired-sess"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let _unused = filter.on_request(&mut ctx).await.unwrap();
+        assert_eq!(ctx.cluster.as_deref(), Some("c-a"));
+        assert_eq!(ctx.get_metadata("grid.route.session.bound"), Some("true"));
+        assert_eq!(ctx.get_metadata("grid.route.session.reused"), Some("false"));
+    }
+
+    #[tokio::test]
+    async fn binding_survives_reload_with_same_stable_id() {
+        let snap = make_overlay_snapshot(&[("new_and_existing", "c-a")]);
+        let shared = Arc::new(ArcSwap::from_pointee(snap));
+        let affinity = make_test_affinity();
+        let filter = make_affinity_filter(Arc::clone(&shared), Some(affinity));
+
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
+        req.headers
+            .insert("x-session-id", http::HeaderValue::from_static("sticky"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let _unused = filter.on_request(&mut ctx).await.unwrap();
+        assert_eq!(ctx.cluster.as_deref(), Some("c-a"));
+
+        let snap_v2 = make_overlay_snapshot(&[("new_and_existing", "c-a")]);
+        shared.store(Arc::new(snap_v2));
+
+        let mut req2 = crate::test_utils::make_request(Method::POST, "/chat");
+        req2.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
+        req2.headers
+            .insert("x-session-id", http::HeaderValue::from_static("sticky"));
+        let mut ctx2 = crate::test_utils::make_filter_context(&req2);
+        let _unused = filter.on_request(&mut ctx2).await.unwrap();
+        assert_eq!(ctx2.cluster.as_deref(), Some("c-a"));
+        assert_eq!(ctx2.get_metadata("grid.route.session.reused"), Some("true"));
+    }
+
+    #[tokio::test]
+    async fn missing_candidate_after_reload_fails_over() {
+        let snap = make_overlay_snapshot(&[("new_and_existing", "c-a"), ("new_and_existing", "c-b")]);
+        let shared = Arc::new(ArcSwap::from_pointee(snap));
+        let affinity = make_test_affinity();
+        affinity.bindings.insert(
+            "sess-1".to_owned(),
+            Binding {
+                expires: Instant::now() + Duration::from_secs(300),
+                stable_id: Arc::from("inference_model/llama/s/c-a"),
+            },
+        );
+        let filter = make_affinity_filter(Arc::clone(&shared), Some(affinity));
+
+        let snap_v2 = make_overlay_snapshot(&[("new_and_existing", "c-b")]);
+        shared.store(Arc::new(snap_v2));
+
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
+        req.headers
+            .insert("x-session-id", http::HeaderValue::from_static("sess-1"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let _unused = filter.on_request(&mut ctx).await.unwrap();
+        assert_eq!(
+            ctx.cluster.as_deref(),
+            Some("c-b"),
+            "should fail over to remaining candidate"
+        );
+        assert_eq!(ctx.get_metadata("grid.route.session.reused"), Some("false"));
+        assert_eq!(ctx.get_metadata("grid.route.session.failover"), Some("true"));
+    }
+
+    #[tokio::test]
+    async fn no_session_key_no_binding() {
+        let snap = make_overlay_snapshot(&[("new_and_existing", "c-a")]);
+        let shared = Arc::new(ArcSwap::from_pointee(snap));
+        let affinity = make_test_affinity();
+        let filter = make_affinity_filter(shared, Some(affinity));
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let _unused = filter.on_request(&mut ctx).await.unwrap();
+        assert_eq!(ctx.cluster.as_deref(), Some("c-a"));
+        assert!(
+            filter.session_affinity.as_ref().unwrap().bindings.is_empty(),
+            "no session key means no binding stored"
+        );
+        assert_eq!(ctx.get_metadata("grid.route.session.bound"), Some("false"));
+    }
+
+    #[tokio::test]
+    async fn capacity_limit_does_not_grow_unbounded() {
+        let snap = make_overlay_snapshot(&[("new_and_existing", "c-a")]);
+        let shared = Arc::new(ArcSwap::from_pointee(snap));
+        let affinity = make_test_affinity();
+        for i in 0..MAX_BINDINGS {
+            affinity.bindings.insert(
+                format!("fill-{i}"),
+                Binding {
+                    expires: Instant::now() + Duration::from_secs(3600),
+                    stable_id: Arc::from("x"),
+                },
+            );
+        }
+        let filter = make_affinity_filter(shared, Some(affinity));
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
+        req.headers
+            .insert("x-session-id", http::HeaderValue::from_static("overflow"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let _unused = filter.on_request(&mut ctx).await.unwrap();
+        assert_eq!(
+            ctx.cluster.as_deref(),
+            Some("c-a"),
+            "routing should succeed even at capacity"
+        );
+        let aff = filter.session_affinity.as_ref().unwrap();
+        assert!(aff.bindings.len() <= MAX_BINDINGS, "bindings must not exceed capacity");
+    }
+
+    // ---- Session affinity config validation ----
+
+    #[test]
+    fn session_affinity_default_disabled() {
+        let yaml = "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\nsession_affinity:\n  enabled: false\n";
+        assert!(parse(yaml).is_ok(), "disabled session_affinity should parse");
+    }
+
+    #[test]
+    fn session_affinity_enabled_requires_source() {
+        let yaml = "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\nsession_affinity:\n  enabled: true\n";
+        let err = parse_err(yaml);
+        assert!(
+            err.to_string().contains("requires at least one"),
+            "enabled without source should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn session_affinity_blank_header_rejected() {
+        let yaml = "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\nsession_affinity:\n  enabled: true\n  header: \"   \"\n";
+        let err = parse_err(yaml);
+        assert!(
+            err.to_string().contains("requires at least one"),
+            "blank header should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn session_affinity_ttl_bounds() {
+        let yaml_zero = "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\nsession_affinity:\n  enabled: true\n  header: x-session-id\n  ttl_secs: 0\n";
+        let err = parse_err(yaml_zero);
+        assert!(
+            err.to_string().contains("ttl_secs must be"),
+            "zero ttl should be rejected: {err}"
+        );
+
+        let yaml_high = "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\nsession_affinity:\n  enabled: true\n  header: x-session-id\n  ttl_secs: 100000\n";
+        let err2 = parse_err(yaml_high);
+        assert!(
+            err2.to_string().contains("ttl_secs must be"),
+            "over-max ttl should be rejected: {err2}"
+        );
+    }
+
+    #[test]
+    fn session_affinity_valid_with_header() {
+        let yaml = "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\nsession_affinity:\n  enabled: true\n  header: x-session-id\n";
+        assert!(parse(yaml).is_ok(), "valid session_affinity with header should parse");
+    }
+
+    #[test]
+    fn session_affinity_valid_with_cookie() {
+        let yaml = "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\nsession_affinity:\n  enabled: true\n  cookie: session_id\n";
+        assert!(parse(yaml).is_ok(), "valid session_affinity with cookie should parse");
+    }
+
+    // ---- Route metadata with new fields ----
+
+    #[tokio::test]
+    async fn route_metadata_includes_stable_id_and_admission() {
+        let f = make_filter(&[("inference_model", "llama", "site-a", "local-inf")]);
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let _unused = f.on_request(&mut ctx).await.unwrap();
+        assert!(ctx.get_metadata("grid.route.stable_id").is_some());
+        assert_eq!(ctx.get_metadata("grid.route.admission_state"), Some("new_and_existing"));
+    }
+
+    #[tokio::test]
+    async fn cookie_session_key_extraction() {
+        let snap = make_overlay_snapshot(&[("new_and_existing", "c-a")]);
+        let shared = Arc::new(ArcSwap::from_pointee(snap));
+        let affinity = SessionAffinity {
+            bindings: DashMap::new(),
+            cookie: Some(Arc::from("sid")),
+            header: None,
+            ttl: Duration::from_secs(3600),
+        };
+        let filter = make_affinity_filter(shared, Some(affinity));
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
+        req.headers.insert(
+            http::header::COOKIE,
+            http::HeaderValue::from_static("other=x; sid=my-session; trail=y"),
+        );
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let _unused = filter.on_request(&mut ctx).await.unwrap();
+        assert_eq!(ctx.cluster.as_deref(), Some("c-a"));
+        assert!(
+            filter
+                .session_affinity
+                .as_ref()
+                .unwrap()
+                .bindings
+                .contains_key("my-session"),
+            "cookie-extracted session key should create binding"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_cookie_session_key_is_ignored() {
+        let snap = make_overlay_snapshot(&[("new_and_existing", "c-a")]);
+        let shared = Arc::new(ArcSwap::from_pointee(snap));
+        let affinity = SessionAffinity {
+            bindings: DashMap::new(),
+            cookie: Some(Arc::from("sid")),
+            header: None,
+            ttl: Duration::from_secs(3600),
+        };
+        let filter = make_affinity_filter(shared, Some(affinity));
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
+        let cookie = format!("sid={}", "x".repeat(MAX_HEADER_VALUE_LEN + 1));
+        req.headers
+            .insert(http::header::COOKIE, http::HeaderValue::from_str(&cookie).unwrap());
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let _unused = filter.on_request(&mut ctx).await.unwrap();
+        assert_eq!(ctx.cluster.as_deref(), Some("c-a"));
+        assert!(
+            filter.session_affinity.as_ref().unwrap().bindings.is_empty(),
+            "oversized cookie value must not be stored as a session key"
+        );
+        assert_eq!(ctx.get_metadata("grid.route.session.bound"), Some("false"));
+    }
+
     // ---- Test utilities ----
 
     fn assert_no_route_metadata(ctx: &HttpFilterContext<'_>) {
-        assert!(
-            ctx.get_metadata("grid.route.kind").is_none(),
-            "grid.route.kind should be absent"
-        );
-        assert!(
-            ctx.get_metadata("grid.route.name").is_none(),
-            "grid.route.name should be absent"
-        );
-        assert!(
-            ctx.get_metadata("grid.route.site").is_none(),
-            "grid.route.site should be absent"
-        );
-        assert!(
-            ctx.get_metadata("grid.route.cluster").is_none(),
-            "grid.route.cluster should be absent"
-        );
-        assert!(
-            ctx.get_metadata("grid.route.local_site").is_none(),
-            "grid.route.local_site should be absent"
-        );
+        for key in &[
+            "grid.route.admission_state",
+            "grid.route.cluster",
+            "grid.route.kind",
+            "grid.route.local_site",
+            "grid.route.name",
+            "grid.route.site",
+            "grid.route.stable_id",
+        ] {
+            assert!(ctx.get_metadata(key).is_none(), "{key} should be absent");
+        }
     }
 
     fn parse(yaml: &str) -> Result<Box<dyn HttpFilter>, FilterError> {
@@ -1313,12 +2071,12 @@ mod tests {
     }
 
     fn make_filter(candidates: &[(&str, &str, &str, &str)]) -> Box<dyn HttpFilter> {
-        let scored: Vec<(&str, &str, &str, &str, bool)> =
+        let with_fresh: Vec<(&str, &str, &str, &str, bool)> =
             candidates.iter().map(|(k, n, s, c)| (*k, *n, *s, *c, true)).collect();
-        make_scored_filter(&scored)
+        make_filter_with_fresh(&with_fresh)
     }
 
-    fn make_scored_filter(candidates: &[(&str, &str, &str, &str, bool)]) -> Box<dyn HttpFilter> {
+    fn make_filter_with_fresh(candidates: &[(&str, &str, &str, &str, bool)]) -> Box<dyn HttpFilter> {
         use std::fmt::Write as _;
 
         let mut yaml = String::from("local_site: site-a\ncandidates:\n");
@@ -1376,5 +2134,44 @@ mod tests {
         let mut ctx = crate::test_utils::make_filter_context(&req);
         let _unused = filter.on_request(&mut ctx).await.unwrap();
         ctx.cluster.as_deref().map(str::to_owned)
+    }
+
+    fn make_test_affinity() -> SessionAffinity {
+        SessionAffinity {
+            bindings: DashMap::new(),
+            cookie: None,
+            header: Some(http::header::HeaderName::from_static("x-session-id")),
+            ttl: Duration::from_secs(3600),
+        }
+    }
+
+    fn make_affinity_filter(
+        snapshot: Arc<ArcSwap<RouteSnapshot>>,
+        session_affinity: Option<SessionAffinity>,
+    ) -> GridRouteFilter {
+        GridRouteFilter {
+            model_header: http::header::HeaderName::from_static("x-model"),
+            _reload_handle: None,
+            session_affinity,
+            snapshot,
+        }
+    }
+
+    fn make_overlay_snapshot(candidates: &[(&str, &str)]) -> RouteSnapshot {
+        let mut route_candidates = Vec::new();
+        for (admission_str, cluster) in candidates {
+            route_candidates.push(RouteCandidate {
+                admission_state: AdmissionState::from_overlay_str(admission_str),
+                cluster: Arc::from(*cluster),
+                fresh: true,
+                kind: CapabilityKind::InferenceModel,
+                name: Arc::from("llama"),
+                rank: None,
+                selection_tier: None,
+                site: Arc::from("s"),
+                stable_id: descriptor::default_stable_id(CapabilityKind::InferenceModel, "llama", "s", cluster),
+            });
+        }
+        RouteSnapshot::from_static(route_candidates, Arc::from("site-a"))
     }
 }
