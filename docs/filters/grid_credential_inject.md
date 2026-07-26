@@ -3,17 +3,38 @@
 
 # `grid_credential_inject`
 
-Replaces customer authorization with the selected provider credential.
+Replaces caller credentials with the upstream credential selected by `grid_route` or `grid_provider_route`.
+
+## Configuration Notes
+
+Reads `grid.route.credential.*` filter metadata written by the preceding routing filter, looks up the configured token, removes caller authorization, and sets exactly one `Authorization: Bearer <token>` value. Token values are never written to metadata, traces, or error bodies. See the module documentation for the complete data flow and configuration.
 
 ## Configuration
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `credentials` | CredentialEntryConfig[] | yes | Credential entries to resolve at construction time. |
-| `credentials[].name` | string | yes | Secret name. |
-| `credentials[].namespace` | string | yes | Secret namespace. |
-| `credentials[].key` | string | yes | Secret data key. |
-| `credentials[].strategy` | string | no | Injection strategy (default: `bearer_token`). |
-| `credentials[].value` | string | no | Development-only inline source. Kubernetes deployments should use `file` with a Secret volume. |
-| `credentials[].env_var` | string | no | Development-only environment source. |
-| `credentials[].file` | string | no | Secret-volume file, read once when the filter is constructed. |
+| `credentials` | CredentialEntryConfig[] | yes | Credential entries, keyed by secretRef (name/namespace/key). |
+| `credentials[].name` | string | yes | Kubernetes Secret name — must match `grid.route.credential.name`. |
+| `credentials[].namespace` | string | yes | Kubernetes Secret namespace — must match `grid.route.credential.namespace`. |
+| `credentials[].key` | string | yes | Key within `Secret.data` — must match `grid.route.credential.key`. |
+| `credentials[].strategy` | string | no | Credential strategy.  Currently only `"bearer_token"` is supported. |
+| `credentials[].value` | string | no | Inline token value.  Mutually exclusive with `env_var` and `file`. |
+| `credentials[].env_var` | string | no | Environment variable holding the token.  Mutually exclusive with `value` and `file`. |
+| `credentials[].file` | string | no | Path to a file containing the token, read once at filter construction. The file contents are trimmed of leading/trailing whitespace before use. The file must exist, be readable, and be non-empty; construction fails otherwise.  Use this source when the token is mounted from a Kubernetes Secret volume so that token bytes never appear in Praxis `ConfigMap`s. Mutually exclusive with `value` and `env_var`. |
+
+## Example
+
+```yaml
+filter: grid_credential_inject
+credentials:
+  - name: my-api-secret        # matches grid.route.credential.name
+    namespace: grid-system      # matches grid.route.credential.namespace
+    key: token                  # matches grid.route.credential.key
+    strategy: bearer_token      # optional, defaults to bearer_token
+    file: /run/secrets/grid-credentials/my-api-secret/token
+  - name: other-secret
+    namespace: default
+    key: api-key
+    strategy: bearer_token
+    env_var: OTHER_API_TOKEN    # token from environment variable
+```
