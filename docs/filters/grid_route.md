@@ -15,7 +15,7 @@ This filter is registered by the AI proxy (not Praxis core) because it encodes A
 
 **Selection:** the first matching candidate in the configured or Grid-rendered order wins after admission filtering.  Praxis AI does not recompute Grid geography, load, or score.  `admission_state=none` is never eligible.  `admission_state=existing_only` is only eligible through an already-bound session affinity entry.
 
-**Metadata:** on successful selection, bounded in-process filter metadata is written under the `grid.route.` namespace (`kind`, `name`, `site`, `cluster`, `local_site`, `stable_id`, `admission_state`, and optionally `rank`, `selection_tier`).  When session affinity is enabled, `session.bound`, `session.reused`, and `session.failover` keys are also written.  No HTTP forwarding headers are written.  No request-time database, control-plane, or metrics lookups are performed.
+**Metadata:** on successful selection, bounded in-process filter metadata is written under the `grid.route.` namespace (`kind`, `name`, `site`, `cluster`, `local_site`, `stable_id`, `admission_state`, and optionally `rank`, `selection_tier`).  When session affinity is enabled, `session.bound`, `session.reused`, and `session.failover` keys are also written. When the selected cluster is present in `provider_hop_clusters`, client-supplied `x-grid-peer-selected-candidate` and `x-grid-peer-hop-request-id` values are removed and replaced with the selected stable ID and a generated provider-hop request ID. These AI-owned, non-reserved headers are sent only to an mTLS-authenticated provider gateway; the provider must run `peer_identity_trust` before consuming them. No credential reference or value is forwarded. No request-time database, control-plane, or metrics lookups are performed.
 
 **MCP lookup:** if `mcp.method` filter metadata is set to `tools/call` and `mcp.name` is present, `mcp_tool` candidates are matched. Other MCP methods (`initialize`, `notifications/*`, etc.) skip routing.
 
@@ -41,6 +41,7 @@ Supports two modes:
 | `candidates[].site` | string | yes | Site that owns this capability. |
 | `local_site` | string | no | Name of the local site (required in static mode, provided by overlay in overlay mode). |
 | `model_header` | string | no | Header name that carries the model name (default: `X-Model`). |
+| `provider_hop_clusters` | string[] | no | Clusters that terminate the authenticated Grid provider-hop protocol. A selected candidate emits the fixed `x-grid-peer-*` context only when its cluster is present in this allowlist. Each named cluster must use an mTLS-authenticated Praxis provider gateway. Direct API/backend clusters remain absent. |
 | `overlay_file` | PathBuf | no | Path to a Grid overlay JSON file (`grid-config.json`). When set, candidates and `local_site` are read from the overlay instead of the YAML config. |
 | `reload` | ReloadConfig | no | Hot reload configuration for overlay mode. Only valid when `overlay_file` is set.  Providing a `reload:` block with static `candidates` is rejected — static candidates are immutable for the lifetime of the filter. |
 | `reload.enabled` | bool | no | Whether file watching is enabled (default: `true`). |

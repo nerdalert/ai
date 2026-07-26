@@ -10,6 +10,7 @@
 //! proxy mechanics.
 
 pub(crate) mod descriptor;
+pub(crate) mod metadata;
 pub(crate) mod overlay;
 mod route;
 

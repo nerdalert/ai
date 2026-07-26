@@ -21,6 +21,7 @@
 //! No request-time metrics or control-plane lookups are performed.
 
 use std::{
+    collections::BTreeSet,
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -29,11 +30,17 @@ use std::{
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use dashmap::DashMap;
+use http::{HeaderName, HeaderValue};
 use praxis_filter::{FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config};
 use serde::Deserialize;
 
 use super::{
     descriptor::{self, AdmissionState, CandidateConfig, CapabilityKind, RouteCandidate},
+    metadata::{
+        PROVIDER_HOP_REQUEST_ID_HEADER, ROUTE_ADMISSION_STATE, ROUTE_CLUSTER, ROUTE_KIND, ROUTE_LOCAL_SITE, ROUTE_NAME,
+        ROUTE_PROVIDER_HOP_REQUEST_ID, ROUTE_RANK, ROUTE_SELECTION_TIER, ROUTE_SITE, ROUTE_STABLE_ID,
+        SELECTED_CANDIDATE_HEADER,
+    },
     overlay::{self, OverlayReloadHandle, RouteSnapshot},
 };
 
@@ -87,6 +94,15 @@ struct GridRouteConfig {
     /// Header name that carries the model name (default: `X-Model`).
     #[serde(default = "default_model_header")]
     model_header: String,
+
+    /// Clusters that terminate the authenticated Grid provider-hop protocol.
+    ///
+    /// A selected candidate emits the fixed `x-grid-peer-*` context only when
+    /// its cluster is present in this allowlist. Each named cluster must use an
+    /// mTLS-authenticated Praxis provider gateway. Direct API/backend clusters
+    /// remain absent.
+    #[serde(default)]
+    provider_hop_clusters: Vec<String>,
 
     /// Path to a Grid overlay JSON file (`grid-config.json`).
     ///
@@ -188,7 +204,7 @@ struct SessionAffinity {
     cookie: Option<Arc<str>>,
 
     /// Header name to extract the session key from.
-    header: Option<http::header::HeaderName>,
+    header: Option<HeaderName>,
 
     /// Binding time-to-live.
     ttl: Duration,
@@ -268,7 +284,13 @@ enum AffinityOutcome<'a> {
 /// `site`, `cluster`, `local_site`, `stable_id`, `admission_state`, and
 /// optionally `rank`, `selection_tier`).  When session affinity is enabled,
 /// `session.bound`, `session.reused`, and `session.failover` keys are also
-/// written.  No HTTP forwarding headers are written.  No request-time database,
+/// written. When the selected cluster is present in `provider_hop_clusters`,
+/// client-supplied `x-grid-peer-selected-candidate` and
+/// `x-grid-peer-hop-request-id` values are removed and replaced with the
+/// selected stable ID and a generated provider-hop request ID. These AI-owned,
+/// non-reserved headers are sent only to an mTLS-authenticated provider
+/// gateway; the provider must run `peer_identity_trust` before consuming them.
+/// No credential reference or value is forwarded. No request-time database,
 /// control-plane, or metrics lookups are performed.
 ///
 /// **MCP lookup:** if `mcp.method` filter metadata is set to `tools/call`
@@ -298,8 +320,10 @@ enum AffinityOutcome<'a> {
 ///
 /// [`ArcSwap`]: arc_swap::ArcSwap
 pub struct GridRouteFilter {
+    /// Clusters allowed to receive authenticated provider-hop context.
+    provider_hop_clusters: BTreeSet<String>,
     /// Header that carries the model name.
-    model_header: http::header::HeaderName,
+    model_header: HeaderName,
     /// Watcher handle for overlay hot reload (None in static mode).
     _reload_handle: Option<OverlayReloadHandle>,
     /// In-memory session affinity (None when disabled).
@@ -347,10 +371,12 @@ impl GridRouteFilter {
         };
 
         let session_affinity = build_session_affinity(cfg.session_affinity)?;
+        let provider_hop_clusters = validate_provider_hop_clusters(cfg.provider_hop_clusters)?;
 
         Ok(Box::new(Self {
             model_header,
             _reload_handle: reload_handle,
+            provider_hop_clusters,
             session_affinity,
             snapshot,
         }))
@@ -364,7 +390,7 @@ impl GridRouteFilter {
         snap: &RouteSnapshot,
         kind: CapabilityKind,
         name: &str,
-    ) -> FilterAction {
+    ) -> Result<FilterAction, FilterError> {
         let session_key = self.session_affinity.as_ref().and_then(|a| extract_session_key(a, ctx));
         let outcome = resolve_affinity(
             self.session_affinity.as_ref(),
@@ -374,18 +400,18 @@ impl GridRouteFilter {
             name,
         );
         if let AffinityOutcome::Reused(c) = outcome {
-            return apply_reused(ctx, &snap.local_site, c);
+            return apply_reused(ctx, &snap.local_site, c, &self.provider_hop_clusters);
         }
         let failover = matches!(outcome, AffinityOutcome::Failover);
         let Some(c) = select_admitted(&snap.candidates, kind, name) else {
             tracing::debug!(kind = kind.as_str(), name = %name, "grid_route: no candidate");
-            return FilterAction::Reject(Rejection::status(404));
+            return Ok(FilterAction::Reject(Rejection::status(404)));
         };
-        apply_route(ctx, &snap.local_site, c);
+        apply_route(ctx, &snap.local_site, c, &self.provider_hop_clusters)?;
         if let Some(aff) = &self.session_affinity {
             record_session(aff, ctx, &c.stable_id, session_key.as_deref(), failover);
         }
-        FilterAction::Continue
+        Ok(FilterAction::Continue)
     }
 }
 
@@ -427,7 +453,7 @@ fn build_session_affinity(config: Option<SessionAffinityConfig>) -> Result<Optio
         .header
         .as_deref()
         .filter(|h| !h.trim().is_empty())
-        .map(str::parse::<http::header::HeaderName>)
+        .map(str::parse::<HeaderName>)
         .transpose()
         .map_err(|e| -> FilterError { format!("grid: invalid session_affinity.header: {e}").into() })?;
     let cookie = cfg.cookie.as_deref().filter(|c| !c.trim().is_empty()).map(Arc::from);
@@ -437,6 +463,18 @@ fn build_session_affinity(config: Option<SessionAffinityConfig>) -> Result<Optio
         header,
         ttl: Duration::from_secs(cfg.ttl_secs),
     }))
+}
+
+/// Validate and deduplicate the bounded provider-hop cluster allowlist.
+fn validate_provider_hop_clusters(clusters: Vec<String>) -> Result<BTreeSet<String>, FilterError> {
+    let mut validated = BTreeSet::new();
+    for cluster in clusters {
+        descriptor::validate_cluster_name("provider_hop_clusters", &cluster)?;
+        if !validated.insert(cluster) {
+            return Err("grid: duplicate provider_hop_clusters entry".into());
+        }
+    }
+    Ok(validated)
 }
 
 /// Validate session affinity config constraints.
@@ -469,6 +507,13 @@ impl HttpFilter for GridRouteFilter {
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        // Client-supplied Grid protocol context is never allowed to survive an
+        // edge routing decision.
+        ctx.request_headers_to_remove
+            .push(HeaderName::from_static(SELECTED_CANDIDATE_HEADER));
+        ctx.request_headers_to_remove
+            .push(HeaderName::from_static(PROVIDER_HOP_REQUEST_ID_HEADER));
+
         if ctx.cluster.is_some() {
             tracing::debug!("grid_route: cluster already set; preserving");
             return Ok(FilterAction::Continue);
@@ -483,24 +528,36 @@ impl HttpFilter for GridRouteFilter {
             Lookup::Invalid => return Ok(FilterAction::Reject(Rejection::status(400))),
         };
 
-        Ok(self.select_and_route(ctx, &snap, kind, &name))
+        self.select_and_route(ctx, &snap, kind, &name)
     }
 }
 
 /// Apply a reused (session-affinity-bound) candidate.
-fn apply_reused(ctx: &mut HttpFilterContext<'_>, local_site: &Arc<str>, candidate: &RouteCandidate) -> FilterAction {
+fn apply_reused(
+    ctx: &mut HttpFilterContext<'_>,
+    local_site: &Arc<str>,
+    candidate: &RouteCandidate,
+    provider_hop_clusters: &BTreeSet<String>,
+) -> Result<FilterAction, FilterError> {
     ctx.cluster = Some(Arc::clone(&candidate.cluster));
     record_route_decision(ctx, local_site, candidate);
+    write_provider_context(ctx, candidate, provider_hop_clusters)?;
     ctx.set_metadata("grid.route.session.bound", "true");
     ctx.set_metadata("grid.route.session.reused", "true");
     ctx.set_metadata("grid.route.session.failover", "false");
-    FilterAction::Continue
+    Ok(FilterAction::Continue)
 }
 
 /// Set cluster and record route decision metadata.
-fn apply_route(ctx: &mut HttpFilterContext<'_>, local_site: &Arc<str>, candidate: &RouteCandidate) {
+fn apply_route(
+    ctx: &mut HttpFilterContext<'_>,
+    local_site: &Arc<str>,
+    candidate: &RouteCandidate,
+    provider_hop_clusters: &BTreeSet<String>,
+) -> Result<(), FilterError> {
     ctx.cluster = Some(Arc::clone(&candidate.cluster));
     record_route_decision(ctx, local_site, candidate);
+    write_provider_context(ctx, candidate, provider_hop_clusters)
 }
 
 /// Record session-affinity metadata and store a binding.
@@ -547,7 +604,7 @@ enum Lookup {
 /// metadata is present (set by an upstream MCP classifier filter), the
 /// filter dispatches to MCP tool lookup.  Otherwise it falls back to the
 /// configured model header.
-fn extract_lookup(ctx: &HttpFilterContext<'_>, model_header: &http::header::HeaderName) -> Lookup {
+fn extract_lookup(ctx: &HttpFilterContext<'_>, model_header: &HeaderName) -> Lookup {
     if let Some(mcp_method) = ctx.get_metadata("mcp.method") {
         return extract_mcp_lookup(ctx, mcp_method);
     }
@@ -579,7 +636,7 @@ fn extract_mcp_lookup(ctx: &HttpFilterContext<'_>, method: &str) -> Lookup {
 }
 
 /// Extract an inference model lookup from the promoted model header.
-fn extract_model_lookup(ctx: &HttpFilterContext<'_>, model_header: &http::header::HeaderName) -> Lookup {
+fn extract_model_lookup(ctx: &HttpFilterContext<'_>, model_header: &HeaderName) -> Lookup {
     let Some(value) = ctx.request.headers.get(model_header) else {
         tracing::debug!("grid_route: no model header; skipping");
         return Lookup::Skip;
@@ -755,19 +812,59 @@ fn is_admitted_for_new_request(state: AdmissionState) -> bool {
 /// existing `set_metadata` limits.  No HTTP forwarding headers are
 /// written by this function.
 fn record_route_decision(ctx: &mut HttpFilterContext<'_>, local_site: &Arc<str>, candidate: &RouteCandidate) {
-    ctx.set_metadata("grid.route.admission_state", candidate.admission_state.as_str());
-    ctx.set_metadata("grid.route.cluster", &*candidate.cluster);
-    ctx.set_metadata("grid.route.kind", candidate.kind.as_str());
-    ctx.set_metadata("grid.route.local_site", &**local_site);
-    ctx.set_metadata("grid.route.name", &*candidate.name);
-    ctx.set_metadata("grid.route.site", &*candidate.site);
-    ctx.set_metadata("grid.route.stable_id", &*candidate.stable_id);
+    ctx.set_metadata(ROUTE_ADMISSION_STATE, candidate.admission_state.as_str());
+    ctx.set_metadata(ROUTE_CLUSTER, &*candidate.cluster);
+    ctx.set_metadata(ROUTE_KIND, candidate.kind.as_str());
+    ctx.set_metadata(ROUTE_LOCAL_SITE, &**local_site);
+    ctx.set_metadata(ROUTE_NAME, &*candidate.name);
+    ctx.set_metadata(ROUTE_SITE, &*candidate.site);
+    ctx.set_metadata(ROUTE_STABLE_ID, &*candidate.stable_id);
     if let Some(rank) = candidate.rank {
-        ctx.set_metadata("grid.route.rank", rank.to_string());
+        ctx.set_metadata(ROUTE_RANK, rank.to_string());
     }
     if let Some(tier) = &candidate.selection_tier {
-        ctx.set_metadata("grid.route.selection_tier", &**tier);
+        ctx.set_metadata(ROUTE_SELECTION_TIER, &**tier);
     }
+}
+
+/// Emit the minimal AI-owned edge-to-provider context.
+///
+/// These non-reserved headers survive the Praxis upstream boundary. This
+/// function uses remove-and-overwrite semantics so a client value cannot become
+/// peer context. The fields are routing context, not an authorization grant;
+/// the provider pipeline must authenticate and authorize the mTLS peer before
+/// consuming them.
+fn write_provider_context(
+    ctx: &mut HttpFilterContext<'_>,
+    candidate: &RouteCandidate,
+    provider_hop_clusters: &BTreeSet<String>,
+) -> Result<(), FilterError> {
+    if !provider_hop_clusters.contains(candidate.cluster.as_ref()) {
+        return Ok(());
+    }
+    if candidate.stable_id.trim().is_empty() || candidate.stable_id.len() > MAX_HEADER_VALUE_LEN {
+        return Err(
+            format!("grid_route: selected candidate ID must be 1-{MAX_HEADER_VALUE_LEN} non-blank bytes").into(),
+        );
+    }
+
+    let candidate_id = HeaderValue::from_str(candidate.stable_id.as_ref()).map_err(|e| {
+        FilterError::from(format!(
+            "grid_route: selected candidate ID is not a valid header value: {e}"
+        ))
+    })?;
+    let hop_request_id = ctx.id_generator.generate(ctx.time_source);
+    let request_id_value = HeaderValue::from_str(&hop_request_id)
+        .map_err(|e| FilterError::from(format!("grid_route: generated provider-hop request ID is invalid: {e}")))?;
+
+    ctx.request_headers_to_set
+        .push((HeaderName::from_static(SELECTED_CANDIDATE_HEADER), candidate_id));
+    ctx.request_headers_to_set.push((
+        HeaderName::from_static(PROVIDER_HOP_REQUEST_ID_HEADER),
+        request_id_value,
+    ));
+    ctx.set_metadata(ROUTE_PROVIDER_HOP_REQUEST_ID, hop_request_id);
+    Ok(())
 }
 
 // -----------------------------------------------------------------------------
@@ -782,6 +879,7 @@ fn record_route_decision(ctx: &mut HttpFilterContext<'_>, local_site: &Arc<str>,
     clippy::expect_used,
     clippy::indexing_slicing,
     clippy::panic,
+    clippy::too_many_lines,
     reason = "tests"
 )]
 mod tests {
@@ -801,7 +899,7 @@ mod tests {
     async fn default_model_header_is_x_model() {
         let f = make_filter(&[("inference_model", "llama", "site-a", "inf")]);
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
-        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
         let mut ctx = crate::test_utils::make_filter_context(&req);
 
         let action = f.on_request(&mut ctx).await.unwrap();
@@ -885,7 +983,7 @@ mod tests {
     async fn blank_model_header_rejects() {
         let f = make_filter(&[("inference_model", "llama", "site-a", "inf")]);
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
-        req.headers.insert("X-Model", http::HeaderValue::from_static(""));
+        req.headers.insert("X-Model", HeaderValue::from_static(""));
         let mut ctx = crate::test_utils::make_filter_context(&req);
 
         let action = f.on_request(&mut ctx).await.unwrap();
@@ -901,8 +999,7 @@ mod tests {
         let f = make_filter(&[("inference_model", "llama", "site-a", "inf")]);
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
         let big = "a".repeat(MAX_HEADER_VALUE_LEN + 1);
-        req.headers
-            .insert("X-Model", http::HeaderValue::from_str(&big).unwrap());
+        req.headers.insert("X-Model", HeaderValue::from_str(&big).unwrap());
         let mut ctx = crate::test_utils::make_filter_context(&req);
 
         let action = f.on_request(&mut ctx).await.unwrap();
@@ -918,7 +1015,7 @@ mod tests {
         let f = make_filter(&[("inference_model", "llama", "site-a", "inf")]);
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
         req.headers
-            .insert("X-Model", http::HeaderValue::from_bytes(b"\xff\xfe").unwrap());
+            .insert("X-Model", HeaderValue::from_bytes(b"\xff\xfe").unwrap());
         let mut ctx = crate::test_utils::make_filter_context(&req);
 
         let action = f.on_request(&mut ctx).await.unwrap();
@@ -935,8 +1032,7 @@ mod tests {
     async fn unknown_model_rejects_404() {
         let f = make_filter(&[("inference_model", "llama", "site-a", "inf")]);
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
-        req.headers
-            .insert("X-Model", http::HeaderValue::from_static("unknown-model"));
+        req.headers.insert("X-Model", HeaderValue::from_static("unknown-model"));
         let mut ctx = crate::test_utils::make_filter_context(&req);
 
         let action = f.on_request(&mut ctx).await.unwrap();
@@ -951,7 +1047,7 @@ mod tests {
     async fn local_inference_sets_cluster() {
         let f = make_filter(&[("inference_model", "llama", "site-a", "local-inf")]);
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
-        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
         let mut ctx = crate::test_utils::make_filter_context(&req);
 
         let action = f.on_request(&mut ctx).await.unwrap();
@@ -963,7 +1059,7 @@ mod tests {
     async fn remote_inference_sets_gateway_cluster() {
         let f = make_filter(&[("inference_model", "llama", "site-b", "remote-gw")]);
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
-        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
         let mut ctx = crate::test_utils::make_filter_context(&req);
 
         let action = f.on_request(&mut ctx).await.unwrap();
@@ -1002,7 +1098,7 @@ mod tests {
             ("inference_model", "llama", "site-a", "inf-cluster"),
         ]);
         let mut req = crate::test_utils::make_request(Method::POST, "/mcp");
-        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
         let mut ctx = crate::test_utils::make_filter_context(&req);
         ctx.set_metadata("mcp.method", "tools/call");
         ctx.set_metadata("mcp.name", "weather");
@@ -1019,7 +1115,7 @@ mod tests {
     async fn mcp_non_tools_call_skips_even_with_model_header() {
         let f = make_filter(&[("inference_model", "llama", "site-a", "inf-cluster")]);
         let mut req = crate::test_utils::make_request(Method::POST, "/mcp");
-        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
         let mut ctx = crate::test_utils::make_filter_context(&req);
         ctx.set_metadata("mcp.method", "initialize");
 
@@ -1121,7 +1217,7 @@ mod tests {
     async fn preserves_existing_cluster() {
         let f = make_filter(&[("inference_model", "llama", "site-a", "inf")]);
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
-        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
         let mut ctx = crate::test_utils::make_filter_context(&req);
         ctx.cluster = Some(Arc::from("pre-set-cluster"));
 
@@ -1144,7 +1240,7 @@ mod tests {
             ("inference_model", "llama", "site-a", "local-inf"),
         ]);
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
-        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
         let mut ctx = crate::test_utils::make_filter_context(&req);
 
         let _unused = f.on_request(&mut ctx).await.unwrap();
@@ -1162,7 +1258,7 @@ mod tests {
             ("inference_model", "llama", "site-c", "second-remote"),
         ]);
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
-        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
         let mut ctx = crate::test_utils::make_filter_context(&req);
 
         let _unused = f.on_request(&mut ctx).await.unwrap();
@@ -1180,7 +1276,7 @@ mod tests {
             ("inference_model", "llama", "site-c", "fresh-remote", true),
         ]);
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
-        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
         let mut ctx = crate::test_utils::make_filter_context(&req);
 
         let _unused = f.on_request(&mut ctx).await.unwrap();
@@ -1198,7 +1294,7 @@ mod tests {
             ("inference_model", "llama", "site-b", "fresh-remote", true),
         ]);
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
-        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
         let mut ctx = crate::test_utils::make_filter_context(&req);
 
         let _unused = f.on_request(&mut ctx).await.unwrap();
@@ -1216,7 +1312,7 @@ mod tests {
             ("inference_model", "llama", "site-a", "stale-local", false),
         ]);
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
-        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
         let mut ctx = crate::test_utils::make_filter_context(&req);
 
         let _unused = f.on_request(&mut ctx).await.unwrap();
@@ -1236,7 +1332,7 @@ mod tests {
             ("inference_model", "llama", "site-a", "local-inf"),
         ]);
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
-        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
         let mut ctx = crate::test_utils::make_filter_context(&req);
 
         let _unused = f.on_request(&mut ctx).await.unwrap();
@@ -1251,7 +1347,7 @@ mod tests {
     async fn local_route_writes_metadata() {
         let f = make_filter(&[("inference_model", "llama", "site-a", "local-inf")]);
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
-        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
         let mut ctx = crate::test_utils::make_filter_context(&req);
 
         let _unused = f.on_request(&mut ctx).await.unwrap();
@@ -1263,7 +1359,7 @@ mod tests {
     async fn remote_route_writes_metadata() {
         let f = make_filter(&[("inference_model", "llama", "site-b", "remote-gw")]);
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
-        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
         let mut ctx = crate::test_utils::make_filter_context(&req);
 
         let _unused = f.on_request(&mut ctx).await.unwrap();
@@ -1275,7 +1371,7 @@ mod tests {
     async fn unknown_model_writes_no_metadata() {
         let f = make_filter(&[("inference_model", "llama", "site-a", "inf")]);
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
-        req.headers.insert("X-Model", http::HeaderValue::from_static("unknown"));
+        req.headers.insert("X-Model", HeaderValue::from_static("unknown"));
         let mut ctx = crate::test_utils::make_filter_context(&req);
 
         let _unused = f.on_request(&mut ctx).await.unwrap();
@@ -1286,7 +1382,7 @@ mod tests {
     async fn blank_model_writes_no_metadata() {
         let f = make_filter(&[("inference_model", "llama", "site-a", "inf")]);
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
-        req.headers.insert("X-Model", http::HeaderValue::from_static(""));
+        req.headers.insert("X-Model", HeaderValue::from_static(""));
         let mut ctx = crate::test_utils::make_filter_context(&req);
 
         let _unused = f.on_request(&mut ctx).await.unwrap();
@@ -1383,8 +1479,9 @@ mod tests {
     async fn on_request_after_snapshot_swap() {
         let shared = Arc::new(ArcSwap::from_pointee(make_snapshot("cluster-v1")));
         let filter = GridRouteFilter {
-            model_header: http::header::HeaderName::from_static("x-model"),
+            model_header: HeaderName::from_static("x-model"),
             _reload_handle: None,
+            provider_hop_clusters: BTreeSet::new(),
             session_affinity: None,
             snapshot: Arc::clone(&shared),
         };
@@ -1534,8 +1631,9 @@ mod tests {
             "site-a",
         )));
         let filter = GridRouteFilter {
-            model_header: http::header::HeaderName::from_static("x-model"),
+            model_header: HeaderName::from_static("x-model"),
             _reload_handle: None,
+            provider_hop_clusters: BTreeSet::new(),
             session_affinity: None,
             snapshot: Arc::clone(&shared),
         };
@@ -1557,7 +1655,7 @@ mod tests {
             ("inference_model", "llama", "site-b", "fresh-remote", true),
         ]);
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
-        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
         let mut ctx = crate::test_utils::make_filter_context(&req);
 
         let _unused = f.on_request(&mut ctx).await.unwrap();
@@ -1598,9 +1696,8 @@ mod tests {
         let snap = make_overlay_snapshot(&[("existing_only", "c-a"), ("new_and_existing", "c-b")]);
         let filter = make_affinity_filter(Arc::new(ArcSwap::from_pointee(snap)), Some(make_test_affinity()));
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
-        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
-        req.headers
-            .insert("x-session-id", http::HeaderValue::from_static("new-key"));
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
+        req.headers.insert("x-session-id", HeaderValue::from_static("new-key"));
         let mut ctx = crate::test_utils::make_filter_context(&req);
         let _unused = filter.on_request(&mut ctx).await.unwrap();
         assert_eq!(
@@ -1626,7 +1723,7 @@ mod tests {
         let snap = make_overlay_snapshot(&[("existing_only", "c-a"), ("new_and_existing", "c-b")]);
         let filter = make_affinity_filter(Arc::new(ArcSwap::from_pointee(snap)), Some(make_test_affinity()));
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
-        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
         let mut ctx = crate::test_utils::make_filter_context(&req);
         let _unused = filter.on_request(&mut ctx).await.unwrap();
         assert_eq!(
@@ -1651,9 +1748,9 @@ mod tests {
         );
         let filter = make_affinity_filter(shared, Some(affinity));
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
-        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
         req.headers
-            .insert("x-session-id", http::HeaderValue::from_static("returning-user"));
+            .insert("x-session-id", HeaderValue::from_static("returning-user"));
         let mut ctx = crate::test_utils::make_filter_context(&req);
         let _unused = filter.on_request(&mut ctx).await.unwrap();
         assert_eq!(
@@ -1684,9 +1781,8 @@ mod tests {
         shared.store(Arc::new(snap_v2));
 
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
-        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
-        req.headers
-            .insert("x-session-id", http::HeaderValue::from_static("sess-1"));
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
+        req.headers.insert("x-session-id", HeaderValue::from_static("sess-1"));
         let mut ctx = crate::test_utils::make_filter_context(&req);
         let _unused = filter.on_request(&mut ctx).await.unwrap();
         assert_eq!(
@@ -1704,9 +1800,9 @@ mod tests {
         let snap = make_overlay_snapshot(&[("existing_only", "c-a"), ("none", "c-b")]);
         let filter = make_affinity_filter(Arc::new(ArcSwap::from_pointee(snap)), Some(make_test_affinity()));
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
-        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
         req.headers
-            .insert("x-session-id", http::HeaderValue::from_static("brand-new"));
+            .insert("x-session-id", HeaderValue::from_static("brand-new"));
         let mut ctx = crate::test_utils::make_filter_context(&req);
         let action = filter.on_request(&mut ctx).await.unwrap();
         assert!(
@@ -1724,9 +1820,8 @@ mod tests {
         let affinity = make_test_affinity();
         let filter = make_affinity_filter(Arc::clone(&shared), Some(affinity));
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
-        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
-        req.headers
-            .insert("x-session-id", http::HeaderValue::from_static("sess-1"));
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
+        req.headers.insert("x-session-id", HeaderValue::from_static("sess-1"));
         let mut ctx = crate::test_utils::make_filter_context(&req);
         let _unused = filter.on_request(&mut ctx).await.unwrap();
         assert_eq!(ctx.cluster.as_deref(), Some("c-a"));
@@ -1757,9 +1852,8 @@ mod tests {
         );
         let filter = make_affinity_filter(shared, Some(affinity));
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
-        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
-        req.headers
-            .insert("x-session-id", http::HeaderValue::from_static("sess-1"));
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
+        req.headers.insert("x-session-id", HeaderValue::from_static("sess-1"));
         let mut ctx = crate::test_utils::make_filter_context(&req);
         let _unused = filter.on_request(&mut ctx).await.unwrap();
         assert_eq!(ctx.cluster.as_deref(), Some("c-a"));
@@ -1775,9 +1869,8 @@ mod tests {
 
         for key in &["sess-a", "sess-b"] {
             let mut req = crate::test_utils::make_request(Method::POST, "/chat");
-            req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
-            req.headers
-                .insert("x-session-id", http::HeaderValue::from_str(key).unwrap());
+            req.headers.insert("X-Model", HeaderValue::from_static("llama"));
+            req.headers.insert("x-session-id", HeaderValue::from_str(key).unwrap());
             let mut ctx = crate::test_utils::make_filter_context(&req);
             let _unused = filter.on_request(&mut ctx).await.unwrap();
         }
@@ -1800,9 +1893,9 @@ mod tests {
         );
         let filter = make_affinity_filter(shared, Some(affinity));
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
-        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
         req.headers
-            .insert("x-session-id", http::HeaderValue::from_static("expired-sess"));
+            .insert("x-session-id", HeaderValue::from_static("expired-sess"));
         let mut ctx = crate::test_utils::make_filter_context(&req);
         let _unused = filter.on_request(&mut ctx).await.unwrap();
         assert_eq!(ctx.cluster.as_deref(), Some("c-a"));
@@ -1818,9 +1911,8 @@ mod tests {
         let filter = make_affinity_filter(Arc::clone(&shared), Some(affinity));
 
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
-        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
-        req.headers
-            .insert("x-session-id", http::HeaderValue::from_static("sticky"));
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
+        req.headers.insert("x-session-id", HeaderValue::from_static("sticky"));
         let mut ctx = crate::test_utils::make_filter_context(&req);
         let _unused = filter.on_request(&mut ctx).await.unwrap();
         assert_eq!(ctx.cluster.as_deref(), Some("c-a"));
@@ -1829,9 +1921,8 @@ mod tests {
         shared.store(Arc::new(snap_v2));
 
         let mut req2 = crate::test_utils::make_request(Method::POST, "/chat");
-        req2.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
-        req2.headers
-            .insert("x-session-id", http::HeaderValue::from_static("sticky"));
+        req2.headers.insert("X-Model", HeaderValue::from_static("llama"));
+        req2.headers.insert("x-session-id", HeaderValue::from_static("sticky"));
         let mut ctx2 = crate::test_utils::make_filter_context(&req2);
         let _unused = filter.on_request(&mut ctx2).await.unwrap();
         assert_eq!(ctx2.cluster.as_deref(), Some("c-a"));
@@ -1856,9 +1947,8 @@ mod tests {
         shared.store(Arc::new(snap_v2));
 
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
-        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
-        req.headers
-            .insert("x-session-id", http::HeaderValue::from_static("sess-1"));
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
+        req.headers.insert("x-session-id", HeaderValue::from_static("sess-1"));
         let mut ctx = crate::test_utils::make_filter_context(&req);
         let _unused = filter.on_request(&mut ctx).await.unwrap();
         assert_eq!(
@@ -1877,7 +1967,7 @@ mod tests {
         let affinity = make_test_affinity();
         let filter = make_affinity_filter(shared, Some(affinity));
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
-        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
         let mut ctx = crate::test_utils::make_filter_context(&req);
         let _unused = filter.on_request(&mut ctx).await.unwrap();
         assert_eq!(ctx.cluster.as_deref(), Some("c-a"));
@@ -1904,9 +1994,8 @@ mod tests {
         }
         let filter = make_affinity_filter(shared, Some(affinity));
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
-        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
-        req.headers
-            .insert("x-session-id", http::HeaderValue::from_static("overflow"));
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
+        req.headers.insert("x-session-id", HeaderValue::from_static("overflow"));
         let mut ctx = crate::test_utils::make_filter_context(&req);
         let _unused = filter.on_request(&mut ctx).await.unwrap();
         assert_eq!(
@@ -1981,7 +2070,7 @@ mod tests {
     async fn route_metadata_includes_stable_id_and_admission() {
         let f = make_filter(&[("inference_model", "llama", "site-a", "local-inf")]);
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
-        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
         let mut ctx = crate::test_utils::make_filter_context(&req);
         let _unused = f.on_request(&mut ctx).await.unwrap();
         assert!(ctx.get_metadata("grid.route.stable_id").is_some());
@@ -2000,10 +2089,10 @@ mod tests {
         };
         let filter = make_affinity_filter(shared, Some(affinity));
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
-        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
         req.headers.insert(
             http::header::COOKIE,
-            http::HeaderValue::from_static("other=x; sid=my-session; trail=y"),
+            HeaderValue::from_static("other=x; sid=my-session; trail=y"),
         );
         let mut ctx = crate::test_utils::make_filter_context(&req);
         let _unused = filter.on_request(&mut ctx).await.unwrap();
@@ -2031,10 +2120,10 @@ mod tests {
         };
         let filter = make_affinity_filter(shared, Some(affinity));
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
-        req.headers.insert("X-Model", http::HeaderValue::from_static("llama"));
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
         let cookie = format!("sid={}", "x".repeat(MAX_HEADER_VALUE_LEN + 1));
         req.headers
-            .insert(http::header::COOKIE, http::HeaderValue::from_str(&cookie).unwrap());
+            .insert(http::header::COOKIE, HeaderValue::from_str(&cookie).unwrap());
         let mut ctx = crate::test_utils::make_filter_context(&req);
         let _unused = filter.on_request(&mut ctx).await.unwrap();
         assert_eq!(ctx.cluster.as_deref(), Some("c-a"));
@@ -2043,6 +2132,202 @@ mod tests {
             "oversized cookie value must not be stored as a session key"
         );
         assert_eq!(ctx.get_metadata("grid.route.session.bound"), Some("false"));
+    }
+
+    // ---- Provider-hop context ----
+
+    #[tokio::test]
+    async fn provider_context_disabled_strips_spoofed_headers_without_setting_replacements() {
+        let filter = make_provider_context_filter(false);
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
+        req.headers.insert(
+            HeaderName::from_static(SELECTED_CANDIDATE_HEADER),
+            HeaderValue::from_static("spoofed-candidate"),
+        );
+        req.headers.insert(
+            HeaderName::from_static(PROVIDER_HOP_REQUEST_ID_HEADER),
+            HeaderValue::from_static("spoofed-request"),
+        );
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+
+        assert!(matches!(action, FilterAction::Continue));
+        assert_provider_headers_removed(&ctx);
+        assert!(ctx.request_headers_to_set.is_empty());
+    }
+
+    #[tokio::test]
+    async fn provider_context_enabled_overwrites_spoofed_headers() {
+        let filter = make_provider_context_filter(true);
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
+        req.headers.insert(
+            HeaderName::from_static(SELECTED_CANDIDATE_HEADER),
+            HeaderValue::from_static("spoofed-candidate"),
+        );
+        req.headers.insert(
+            HeaderName::from_static(PROVIDER_HOP_REQUEST_ID_HEADER),
+            HeaderValue::from_static("spoofed-request"),
+        );
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+
+        assert!(matches!(action, FilterAction::Continue));
+        assert_provider_headers_removed(&ctx);
+        assert_eq!(
+            pending_header(&ctx, SELECTED_CANDIDATE_HEADER),
+            Some("inference_model/llama/site-b/provider-gateway")
+        );
+        let request_id = pending_header(&ctx, PROVIDER_HOP_REQUEST_ID_HEADER);
+        assert!(request_id.is_some_and(|value| value != "spoofed-request"));
+        assert_eq!(
+            ctx.request_headers_to_set.len(),
+            2,
+            "only fixed peer-context headers may be set"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_context_contains_no_credential_or_provider_output_fields() {
+        let filter = make_provider_context_filter(true);
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+
+        assert!(matches!(action, FilterAction::Continue));
+        let emitted = ctx
+            .request_headers_to_set
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            emitted,
+            [SELECTED_CANDIDATE_HEADER, PROVIDER_HOP_REQUEST_ID_HEADER],
+            "edge may emit only the two fixed peer-context fields"
+        );
+        for (_, value) in &ctx.request_headers_to_set {
+            let value = value.to_str().unwrap();
+            assert!(!value.contains("credential"));
+            assert!(!value.contains("secret"));
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_context_allowlist_excludes_direct_cluster() {
+        let filter = parse(
+            "local_site: site-a\n\
+             provider_hop_clusters: [provider-gateway]\n\
+             candidates:\n\
+             \x20 - kind: inference_model\n\
+             \x20   name: llama\n\
+             \x20   site: site-a\n\
+             \x20   cluster: direct-backend\n",
+        )
+        .unwrap();
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+
+        assert!(matches!(action, FilterAction::Continue));
+        assert_eq!(ctx.cluster.as_deref(), Some("direct-backend"));
+        assert_provider_headers_removed(&ctx);
+        assert!(
+            ctx.request_headers_to_set.is_empty(),
+            "direct candidates must not receive provider-hop context"
+        );
+    }
+
+    #[test]
+    fn provider_hop_cluster_allowlist_rejects_blank_and_duplicates() {
+        let candidate = "candidates:\n  - kind: inference_model\n    name: llama\n    site: site-a\n    cluster: provider-gateway\n";
+        for list in ["['']", "[provider-gateway, provider-gateway]"] {
+            let yaml = format!("local_site: site-a\nprovider_hop_clusters: {list}\n{candidate}");
+            assert!(parse(&yaml).is_err(), "invalid allowlist must fail: {list}");
+        }
+    }
+
+    #[tokio::test]
+    async fn preselected_cluster_still_strips_spoofed_provider_context() {
+        let filter = make_provider_context_filter(true);
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers.insert(
+            HeaderName::from_static(SELECTED_CANDIDATE_HEADER),
+            HeaderValue::from_static("spoofed-candidate"),
+        );
+        req.headers.insert(
+            HeaderName::from_static(PROVIDER_HOP_REQUEST_ID_HEADER),
+            HeaderValue::from_static("spoofed-request"),
+        );
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.cluster = Some(Arc::from("already-selected"));
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+
+        assert!(matches!(action, FilterAction::Continue));
+        assert_provider_headers_removed(&ctx);
+        assert!(ctx.request_headers_to_set.is_empty());
+    }
+
+    #[test]
+    fn provider_context_rejects_empty_and_oversized_stable_ids() {
+        for stable_id in [String::new(), "x".repeat(MAX_HEADER_VALUE_LEN + 1)] {
+            let mut snapshot = make_snapshot("provider-gateway");
+            snapshot.candidates[0].stable_id = Arc::from(stable_id.as_str());
+            let req = crate::test_utils::make_request(Method::POST, "/chat");
+            let mut ctx = crate::test_utils::make_filter_context(&req);
+            let allowlist = BTreeSet::from(["provider-gateway".to_owned()]);
+            let error = write_provider_context(&mut ctx, &snapshot.candidates[0], &allowlist)
+                .expect_err("invalid candidate ID must fail closed");
+            assert!(error.to_string().contains("candidate ID"));
+        }
+    }
+
+    #[tokio::test]
+    async fn affinity_reuse_preserves_candidate_id_and_rotates_hop_request_id() {
+        let snapshot = Arc::new(ArcSwap::from_pointee(make_overlay_snapshot(&[(
+            "new_and_existing",
+            "provider-gateway",
+        )])));
+        let filter = GridRouteFilter {
+            model_header: HeaderName::from_static("x-model"),
+            _reload_handle: None,
+            provider_hop_clusters: BTreeSet::from(["provider-gateway".to_owned()]),
+            session_affinity: Some(make_test_affinity()),
+            snapshot,
+        };
+
+        let mut first = crate::test_utils::make_request(Method::POST, "/chat");
+        first.headers.insert("X-Model", HeaderValue::from_static("llama"));
+        first
+            .headers
+            .insert("x-session-id", HeaderValue::from_static("provider-session"));
+        let mut first_ctx = crate::test_utils::make_filter_context(&first);
+        let _first_action = filter.on_request(&mut first_ctx).await.unwrap();
+
+        let mut second = crate::test_utils::make_request(Method::POST, "/chat");
+        second.headers.insert("X-Model", HeaderValue::from_static("llama"));
+        second
+            .headers
+            .insert("x-session-id", HeaderValue::from_static("provider-session"));
+        let mut second_ctx = crate::test_utils::make_filter_context(&second);
+        let _second_action = filter.on_request(&mut second_ctx).await.unwrap();
+
+        assert_eq!(
+            pending_header(&first_ctx, SELECTED_CANDIDATE_HEADER),
+            pending_header(&second_ctx, SELECTED_CANDIDATE_HEADER)
+        );
+        assert_ne!(
+            pending_header(&first_ctx, PROVIDER_HOP_REQUEST_ID_HEADER),
+            pending_header(&second_ctx, PROVIDER_HOP_REQUEST_ID_HEADER)
+        );
+        assert_eq!(second_ctx.get_metadata("grid.route.session.reused"), Some("true"));
     }
 
     // ---- Test utilities ----
@@ -2090,6 +2375,40 @@ mod tests {
         parse(&yaml).unwrap()
     }
 
+    fn make_provider_context_filter(enabled: bool) -> Box<dyn HttpFilter> {
+        let provider_hop_clusters = if enabled {
+            "provider_hop_clusters: [provider-gateway]\n"
+        } else {
+            ""
+        };
+        parse(&format!(
+            "local_site: site-a\n\
+             {provider_hop_clusters}\
+             candidates:\n\
+             \x20 - kind: inference_model\n\
+             \x20   name: llama\n\
+             \x20   site: site-b\n\
+             \x20   cluster: provider-gateway\n"
+        ))
+        .unwrap()
+    }
+
+    fn assert_provider_headers_removed(ctx: &HttpFilterContext<'_>) {
+        for name in [SELECTED_CANDIDATE_HEADER, PROVIDER_HOP_REQUEST_ID_HEADER] {
+            assert!(
+                ctx.request_headers_to_remove.contains(&HeaderName::from_static(name)),
+                "{name} must be removed"
+            );
+        }
+    }
+
+    fn pending_header<'a>(ctx: &'a HttpFilterContext<'_>, name: &'static str) -> Option<&'a str> {
+        ctx.request_headers_to_set
+            .iter()
+            .find(|(header, _)| header == name)
+            .and_then(|(_, value)| value.to_str().ok())
+    }
+
     fn make_two_candidate_snapshot(cluster1: &str, site1: &str, cluster2: &str, site2: &str) -> RouteSnapshot {
         RouteSnapshot::from_static(
             descriptor::validate_candidates(vec![
@@ -2129,8 +2448,7 @@ mod tests {
 
     async fn route_model(filter: &GridRouteFilter, model: &str) -> Option<String> {
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
-        req.headers
-            .insert("X-Model", http::HeaderValue::from_str(model).unwrap());
+        req.headers.insert("X-Model", HeaderValue::from_str(model).unwrap());
         let mut ctx = crate::test_utils::make_filter_context(&req);
         let _unused = filter.on_request(&mut ctx).await.unwrap();
         ctx.cluster.as_deref().map(str::to_owned)
@@ -2140,7 +2458,7 @@ mod tests {
         SessionAffinity {
             bindings: DashMap::new(),
             cookie: None,
-            header: Some(http::header::HeaderName::from_static("x-session-id")),
+            header: Some(HeaderName::from_static("x-session-id")),
             ttl: Duration::from_secs(3600),
         }
     }
@@ -2150,8 +2468,9 @@ mod tests {
         session_affinity: Option<SessionAffinity>,
     ) -> GridRouteFilter {
         GridRouteFilter {
-            model_header: http::header::HeaderName::from_static("x-model"),
+            model_header: HeaderName::from_static("x-model"),
             _reload_handle: None,
+            provider_hop_clusters: BTreeSet::new(),
             session_affinity,
             snapshot,
         }
