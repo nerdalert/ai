@@ -10,8 +10,7 @@
 //! The overlay wire types ([`OverlayDocument`], [`OverlayCandidate`])
 //! mirror the JSON structure rendered by the Grid operator into a
 //! Kubernetes `ConfigMap`.  Only the fields needed for routing are
-//! consumed; credential references are deserialized for type
-//! compatibility but not used by `grid_route`.
+//! consumed, including credential references without secret values.
 //!
 //! [`ArcSwap`]: arc_swap::ArcSwap
 
@@ -30,7 +29,10 @@ use sha2::{Digest as _, Sha256};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::descriptor::{self, AdmissionState, CandidateConfig, CapabilityKind, RouteCandidate};
+use super::{
+    descriptor::{self, AdmissionState, CandidateConfig, CapabilityKind, RouteCandidate},
+    metadata::{CandidateCredential, CredentialRef},
+};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -94,14 +96,8 @@ pub(crate) struct OverlayCandidate {
 
     /// Credential reference projected by the operator.
     ///
-    /// Deserialized for type compatibility; **not used** by `grid_route`.
-    /// The `grid_credential_inject` filter (PR #386) consumes this field.
+    /// Carried as bounded in-process metadata for `grid_credential_inject`.
     #[serde(default)]
-    #[expect(
-        clippy::allow_attributes,
-        reason = "dead_code fires only in lib, not in test; expect would be unfulfilled in test"
-    )]
-    #[allow(dead_code, reason = "type compatibility with Grid overlay")]
     credential: Option<OverlayCredential>,
 
     /// Whether this candidate is considered fresh by the Grid operator.
@@ -142,7 +138,6 @@ fn default_fresh() -> bool {
 /// should never appear in the overlay.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-#[expect(dead_code, reason = "type compatibility with Grid overlay")]
 struct OverlayCredential {
     /// Authentication strategy (e.g. `"bearer_token"`).
     strategy: String,
@@ -158,7 +153,6 @@ struct OverlayCredential {
 /// `token` that might contain actual secret material.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-#[expect(dead_code, reason = "type compatibility with Grid overlay")]
 struct OverlaySecretRef {
     /// Secret name.
     name: String,
@@ -252,6 +246,14 @@ fn overlay_to_candidates(doc: &OverlayDocument) -> Result<Vec<RouteCandidate>, F
             let kind = CapabilityKind::from_overlay_str(&oc.kind)?;
             Ok(CandidateConfig {
                 cluster: oc.cluster.clone(),
+                credential: oc.credential.as_ref().map(|credential| CandidateCredential {
+                    strategy: credential.strategy.clone(),
+                    secret_ref: CredentialRef {
+                        name: credential.secret_ref.name.clone(),
+                        namespace: credential.secret_ref.namespace.clone(),
+                        key: credential.secret_ref.key.clone(),
+                    },
+                }),
                 fresh: oc.fresh,
                 kind,
                 name: oc.name.clone(),

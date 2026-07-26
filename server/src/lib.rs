@@ -39,16 +39,46 @@ fn register_ai_filters(registry: &mut praxis_filter::FilterRegistry) {
     register_grid_filters(registry);
 }
 
-/// Register Grid gateway-to-gateway routing filters.
+/// Register Grid edge and provider-hop filters.
 ///
-/// `grid_route` belongs in the AI proxy (not Praxis core) because it
-/// encodes AI/Grid-specific semantics: candidate freshness preference,
-/// local-site scoring, and MCP tool-call routing.
+/// These belong in the AI proxy (not Praxis core) because they encode
+/// AI/Grid-specific selection, provider-local policy, and credential-reference
+/// semantics.
 fn register_grid_filters(registry: &mut praxis_filter::FilterRegistry) {
     praxis_filter::register_filters!(
         @register registry,
         http "grid_route" => praxis_ai_filters::GridRouteFilter::from_config
     );
+    register_grid_security_filter(
+        registry,
+        "grid_provider_route",
+        praxis_ai_filters::GridProviderRouteFilter::from_config,
+    );
+    register_grid_security_filter(
+        registry,
+        "grid_credential_inject",
+        praxis_ai_filters::GridCredentialInjectFilter::from_config,
+    );
+}
+
+/// Register a Grid HTTP filter as security-critical.
+#[expect(
+    clippy::type_complexity,
+    reason = "single-use registration helper; a type alias adds indirection"
+)]
+#[expect(clippy::panic, reason = "duplicate filter registration is a fatal configuration bug")]
+fn register_grid_security_filter(
+    registry: &mut praxis_filter::FilterRegistry,
+    name: &'static str,
+    factory: fn(&serde_yaml::Value) -> Result<Box<dyn praxis_filter::HttpFilter>, praxis_filter::FilterError>,
+) {
+    registry
+        .register_with_class(
+            name,
+            praxis_filter::FilterFactory::Http(std::sync::Arc::new(factory)),
+            praxis_filter::SecurityClass::Security,
+        )
+        .unwrap_or_else(|_| panic!("duplicate filter name: '{name}'"));
 }
 
 /// Register agentic protocol filters (A2A, MCP).
@@ -179,4 +209,71 @@ fn register_openai_response_filters(registry: &mut praxis_filter::FilterRegistry
         @register registry,
         http "openai_mcp_dispatch" => praxis_ai_apis::openai::McpDispatchFilter::from_config
     );
+}
+
+#[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(
+    clippy::expect_used,
+    clippy::panic,
+    clippy::too_many_lines,
+    clippy::unwrap_used,
+    reason = "tests"
+)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grid_filters_are_registered_exactly_once() {
+        let registry = build_full_registry();
+        let names = registry.available_filters();
+        for expected in ["grid_route", "grid_provider_route", "grid_credential_inject"] {
+            assert_eq!(
+                names.iter().filter(|name| **name == expected).count(),
+                1,
+                "{expected} must be registered exactly once"
+            );
+        }
+        assert!(!registry.is_security_filter("grid_route"));
+        assert!(registry.is_security_filter("grid_provider_route"));
+        assert!(registry.is_security_filter("grid_credential_inject"));
+    }
+
+    #[test]
+    fn provider_pipeline_filters_construct_from_registry() {
+        let registry = build_full_registry();
+        let peer_config = serde_yaml::from_str(
+            "trusted_peers:\n\
+             \x20 - cert_digest: 0000000000000000000000000000000000000000000000000000000000000000\n\
+             \x20   organization: ai-grid\n",
+        )
+        .expect("peer config");
+        let provider_route_config = serde_yaml::from_str(
+            "provider_id: site-a\n\
+             routes:\n\
+             \x20 - candidate_id: candidate-a\n\
+             \x20   cluster: backend\n\
+             \x20   model: model-a\n\
+             \x20   paths: [/v1/chat/completions]\n",
+        )
+        .expect("provider route config");
+        let credential_config = serde_yaml::from_str(
+            "credentials:\n\
+             \x20 - name: provider-token\n\
+             \x20   namespace: grid-system\n\
+             \x20   key: token\n\
+             \x20   value: test-only-token\n",
+        )
+        .expect("credential config");
+
+        for (name, config) in [
+            ("peer_identity_trust", &peer_config),
+            ("grid_provider_route", &provider_route_config),
+            ("grid_credential_inject", &credential_config),
+        ] {
+            registry
+                .create(name, config)
+                .unwrap_or_else(|error| panic!("{name} must construct from the full registry: {error}"));
+        }
+    }
 }

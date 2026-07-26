@@ -35,6 +35,12 @@ Supports two modes:
 |-------|------|---------|-------------|
 | `candidates` | CandidateConfig[] | no | Static list of route candidates (mutually exclusive with `overlay_file`). |
 | `candidates[].cluster` | string | yes | Cluster name to select when this candidate is chosen. |
+| `candidates[].credential` | CandidateCredential | no | Optional final-hop credential reference. |
+| `candidates[].credential.strategy` | string | yes | Injection strategy. |
+| `candidates[].credential.secret_ref` | CredentialRef | yes | Secret locator, never secret bytes. |
+| `candidates[].credential.secret_ref.key` | string | yes | Secret data key. |
+| `candidates[].credential.secret_ref.name` | string | yes | Secret name. |
+| `candidates[].credential.secret_ref.namespace` | string | yes | Secret namespace. |
 | `candidates[].fresh` | bool | no | Whether this candidate is fresh (default: `true`). |
 | `candidates[].kind` | `inference_model` \| `mcp_tool` | yes | Capability kind. |
 | `candidates[].name` | string | yes | Capability name (model name, tool name, or agent name). |

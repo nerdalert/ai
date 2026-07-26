@@ -53,6 +53,8 @@ see the [Praxis core filter reference][core-ref].
 
 | Filter | Description |
 |--------|-------------|
+| [`grid_credential_inject`](grid_credential_inject.md) | Replaces customer authorization with the selected provider credential. |
+| [`grid_provider_route`](grid_provider_route.md) | Exact provider-local mapping from an authenticated Grid selection to a private backend cluster. |
 | [`grid_route`](grid_route.md) | Selects an upstream cluster from a site/capability descriptor by matching either an inference model name or MCP tool name. |
 
 ### Guardrails

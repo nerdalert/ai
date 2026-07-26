@@ -39,7 +39,7 @@ use super::{
     metadata::{
         PROVIDER_HOP_REQUEST_ID_HEADER, ROUTE_ADMISSION_STATE, ROUTE_CLUSTER, ROUTE_KIND, ROUTE_LOCAL_SITE, ROUTE_NAME,
         ROUTE_PROVIDER_HOP_REQUEST_ID, ROUTE_RANK, ROUTE_SELECTION_TIER, ROUTE_SITE, ROUTE_STABLE_ID,
-        SELECTED_CANDIDATE_HEADER,
+        SELECTED_CANDIDATE_HEADER, set_credential_metadata,
     },
     overlay::{self, OverlayReloadHandle, RouteSnapshot},
 };
@@ -825,6 +825,7 @@ fn record_route_decision(ctx: &mut HttpFilterContext<'_>, local_site: &Arc<str>,
     if let Some(tier) = &candidate.selection_tier {
         ctx.set_metadata(ROUTE_SELECTION_TIER, &**tier);
     }
+    set_credential_metadata(ctx, candidate.credential.as_ref());
 }
 
 /// Emit the minimal AI-owned edge-to-provider context.
@@ -2414,6 +2415,7 @@ mod tests {
             descriptor::validate_candidates(vec![
                 CandidateConfig {
                     cluster: cluster1.to_owned(),
+                    credential: None,
                     fresh: true,
                     kind: CapabilityKind::InferenceModel,
                     name: "llama".to_owned(),
@@ -2421,6 +2423,7 @@ mod tests {
                 },
                 CandidateConfig {
                     cluster: cluster2.to_owned(),
+                    credential: None,
                     fresh: true,
                     kind: CapabilityKind::InferenceModel,
                     name: "llama".to_owned(),
@@ -2436,6 +2439,7 @@ mod tests {
         RouteSnapshot::from_static(
             descriptor::validate_candidates(vec![CandidateConfig {
                 cluster: cluster.to_owned(),
+                credential: None,
                 fresh: true,
                 kind: CapabilityKind::InferenceModel,
                 name: "llama".to_owned(),
@@ -2482,6 +2486,7 @@ mod tests {
             route_candidates.push(RouteCandidate {
                 admission_state: AdmissionState::from_overlay_str(admission_str),
                 cluster: Arc::from(*cluster),
+                credential: None,
                 fresh: true,
                 kind: CapabilityKind::InferenceModel,
                 name: Arc::from("llama"),

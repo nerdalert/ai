@@ -3,15 +3,18 @@
 
 //! Grid gateway-to-gateway routing filters.
 //!
-//! Provides the `grid_route` filter for static AI Grid inference model
-//! and MCP tool routing.  This filter belongs in the AI proxy because
-//! it encodes AI/Grid-specific semantics — candidate freshness, local-site
-//! preference, and MCP tool-call routing — that are not generic Praxis
-//! proxy mechanics.
+//! Provides the edge `grid_route` filter and the provider-side
+//! `grid_provider_route` and `grid_credential_inject` filters. These belong in
+//! the AI proxy because they encode Grid and inference-specific contracts, not
+//! generic Praxis proxy mechanics.
 
+mod credential_inject;
 pub(crate) mod descriptor;
 pub(crate) mod metadata;
 pub(crate) mod overlay;
+mod provider_route;
 mod route;
 
+pub use credential_inject::GridCredentialInjectFilter;
+pub use provider_route::GridProviderRouteFilter;
 pub use route::GridRouteFilter;

@@ -2948,6 +2948,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "yaml_serde",
+ "zeroize",
 ]
 
 [[package]]
@@ -2963,6 +2964,7 @@ dependencies = [
  "praxis-proxy-core",
  "praxis-proxy-filter",
  "praxis-proxy-protocol",
+ "praxis-proxy-tls",
  "serde",
  "tempfile",
  "tikv-jemallocator",

@@ -1,0 +1,58 @@
+# Provider-side Praxis AI inference pipeline.
+#
+# The deployment must configure the listener for downstream mTLS and put
+# Praxis `peer_identity_trust` first in this chain. Those controls authenticate
+# and authorize the edge gateway before the AI-owned x-grid-peer-* fields can
+# influence routing; this chain validates only provider-local inference policy.
+
+listeners:
+  - name: provider
+    address: "0.0.0.0:8443"
+    filter_chains:
+      - provider-inference
+
+filter_chains:
+  - name: provider-inference
+    filters:
+      # Parse the OpenAI-compatible request and promote model to X-Model.
+      - filter: json_body_field
+        field: model
+        header: X-Model
+
+      # Exact local policy mapping. This is not another Grid routing engine.
+      - filter: grid_provider_route
+        provider_id: site-us-west
+        model_header: X-Model
+        emit_demo_attribution: true
+        routes:
+          - candidate_id: inference_model/mock-model/site-us-west/provider-us-west
+            model: mock-model
+            paths:
+              - /v1/chat/completions
+              - /v1/responses
+            cluster: mock-backend
+
+      # No-op for the mock route. API-provider routes can select a mounted
+      # credential reference from the provider-local map above.
+      - filter: grid_credential_inject
+        credentials:
+          - strategy: bearer_token
+            name: openai-provider
+            namespace: grid-demo
+            key: token
+            file: /run/secrets/grid-credentials/openai-provider/token
+
+      - filter: load_balancer
+        clusters:
+          - name: mock-backend
+            endpoints:
+              - "mock-backend.grid-demo.svc.cluster.local:8080"
+          - name: openai-api
+            endpoints:
+              - "api.openai.com:443"
+            tls:
+              sni: api.openai.com
+
+admin:
+  address: "127.0.0.1:9901"
+shutdown_timeout_secs: 5
