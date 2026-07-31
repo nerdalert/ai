@@ -3,7 +3,7 @@
 
 //! Static site/capability descriptor model for gateway-to-gateway routing.
 //!
-//! Defines the local routing records consumed by the `grid_route`
+//! Defines the local routing records consumed by the `intelligent_route`
 //! filter. Records are validated at parse time and read immutably
 //! during request handling.
 //!
@@ -135,25 +135,33 @@ pub(crate) struct RouteCandidate {
 /// Returns [`FilterError`] if:
 /// - the candidate list is empty or exceeds [`MAX_CANDIDATES`]
 /// - any name/site/cluster field is blank or oversized
-/// - duplicate (kind, name, site) tuples exist
+/// - duplicate (kind, name, site, cluster) tuples exist
+#[expect(clippy::too_many_lines, reason = "single validation pass over all candidate fields")]
 pub(crate) fn validate_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<RouteCandidate>, FilterError> {
     if raw.is_empty() {
-        return Err("grid: candidates list must not be empty".into());
+        return Err("routing: candidates list must not be empty".into());
     }
     if raw.len() > MAX_CANDIDATES {
-        return Err(format!("grid: candidates exceeds maximum of {MAX_CANDIDATES}").into());
+        return Err(format!("routing: candidates exceeds maximum of {MAX_CANDIDATES}").into());
     }
 
     let mut candidates = Vec::with_capacity(raw.len());
-    let mut seen: HashSet<(CapabilityKind, String, String)> = HashSet::with_capacity(raw.len());
+    let mut seen: HashSet<(CapabilityKind, String, String, String)> = HashSet::with_capacity(raw.len());
 
     for (i, c) in raw.into_iter().enumerate() {
         validate_name(&format!("candidates[{i}].name"), &c.name)?;
         validate_name(&format!("candidates[{i}].site"), &c.site)?;
         validate_name(&format!("candidates[{i}].cluster"), &c.cluster)?;
 
-        if !seen.insert((c.kind, c.name.clone(), c.site.clone())) {
-            return Err(format!("grid: duplicate candidate '{}/{}/{}'", c.kind.as_str(), c.name, c.site).into());
+        if !seen.insert((c.kind, c.name.clone(), c.site.clone(), c.cluster.clone())) {
+            return Err(format!(
+                "routing: duplicate candidate '{}/{}/{}:{}'",
+                c.kind.as_str(),
+                c.name,
+                c.site,
+                c.cluster
+            )
+            .into());
         }
 
         candidates.push(RouteCandidate {
@@ -173,13 +181,13 @@ pub(crate) fn validate_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<Route
 /// Rejects blank, unparseable, or reserved-prefix header names.
 pub(crate) fn validate_model_header(raw: &str) -> Result<http::header::HeaderName, FilterError> {
     if raw.trim().is_empty() {
-        return Err("grid: model_header must not be empty".into());
+        return Err("routing: model_header must not be empty".into());
     }
     let header: http::header::HeaderName = raw
         .parse()
-        .map_err(|e| -> FilterError { format!("grid: invalid model_header: {e}").into() })?;
+        .map_err(|e| -> FilterError { format!("routing: invalid model_header: {e}").into() })?;
     if RESERVED_HEADER_PREFIXES.iter().any(|p| header.as_str().starts_with(p)) {
-        return Err("grid: model_header must not use a reserved internal header prefix".into());
+        return Err("routing: model_header must not use a reserved internal header prefix".into());
     }
     Ok(header)
 }
@@ -192,7 +200,7 @@ pub(crate) fn validate_local_site(value: &str) -> Result<(), FilterError> {
 /// Validate a bounded, non-blank identifier.
 fn validate_name(field: &str, value: &str) -> Result<(), FilterError> {
     if value.trim().is_empty() || value.len() > MAX_NAME_LEN {
-        return Err(format!("grid: {field} must be 1-{MAX_NAME_LEN} non-blank characters").into());
+        return Err(format!("routing: {field} must be 1-{MAX_NAME_LEN} non-blank characters").into());
     }
     Ok(())
 }
@@ -308,10 +316,22 @@ mod tests {
     fn duplicate_candidate_rejected() {
         let err = validate_candidates(vec![
             candidate("inference_model", "llama", "site-a", "c1"),
-            candidate("inference_model", "llama", "site-a", "c2"),
+            candidate("inference_model", "llama", "site-a", "c1"),
         ])
         .expect_err("should fail");
         assert!(err.to_string().contains("duplicate candidate"), "{err}");
+    }
+
+    #[test]
+    fn same_name_same_site_different_cluster_not_duplicate() {
+        let result = validate_candidates(vec![
+            candidate("inference_model", "llama", "site-a", "c1"),
+            candidate("inference_model", "llama", "site-a", "c2"),
+        ]);
+        assert!(
+            result.is_ok(),
+            "same model on same site with different clusters is not a duplicate"
+        );
     }
 
     #[test]
