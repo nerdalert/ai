@@ -30,6 +30,7 @@ mod openai_responses_validate;
 mod openai_stream_events;
 mod openai_tool_parse;
 mod prompt_enrichment;
+mod provider_route;
 mod rehydrate;
 mod responses_routing;
 mod session_replay;

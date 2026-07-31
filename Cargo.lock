@@ -3018,6 +3018,7 @@ dependencies = [
  "tracing",
  "wiremock",
  "yaml_serde",
+ "zeroize",
 ]
 
 [[package]]
@@ -3033,6 +3034,7 @@ dependencies = [
  "praxis-proxy-core",
  "praxis-proxy-filter",
  "praxis-proxy-protocol",
+ "praxis-proxy-tls",
  "serde",
  "tempfile",
  "tikv-jemallocator",
@@ -3197,11 +3199,14 @@ dependencies = [
  "futures",
  "http",
  "nix",
+ "praxis-ai-proxy",
  "praxis-proxy-core",
  "praxis-proxy-filter",
  "praxis-test-utils",
+ "rustls-pemfile",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "sqlx",
  "tempfile",
  "tokio",
