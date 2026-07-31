@@ -83,6 +83,10 @@ mod tests {
 
     use super::*;
 
+    fn test_subrequest_client() -> praxis_core::subrequest::SubRequestClient {
+        praxis_core::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(8, None))
+    }
+
     #[test]
     fn default_config_parses_successfully() {
         let config = Config::from_yaml(DEFAULT_CONFIG).expect("DEFAULT_CONFIG should parse");
@@ -115,7 +119,7 @@ mod tests {
 
     #[test]
     fn routing_filters_are_registered_exactly_once() {
-        let registry = build_full_registry();
+        let registry = build_full_registry(&test_subrequest_client());
         let names = registry.available_filters();
         for expected in ["intelligent_route", "provider_route", "credential_inject"] {
             assert_eq!(
@@ -131,7 +135,7 @@ mod tests {
 
     #[test]
     fn provider_pipeline_filters_construct_from_registry() {
-        let registry = build_full_registry();
+        let registry = build_full_registry(&test_subrequest_client());
         let peer_config = serde_yaml::from_str(
             "trusted_peers:\n\
              \x20 - cert_digest: 0000000000000000000000000000000000000000000000000000000000000000\n\
