@@ -8,7 +8,7 @@
 //! during request handling.
 //!
 //! This module defines the data model only. Scoring and route
-//! extraction logic live in the `route` sibling module.
+//! extraction logic live in the `intelligent_route` sibling module.
 
 use std::{collections::HashSet, sync::Arc};
 
@@ -46,12 +46,74 @@ pub(crate) enum CapabilityKind {
     McpTool,
 }
 
+// -----------------------------------------------------------------------------
+// AdmissionState
+// -----------------------------------------------------------------------------
+
+/// Producer-assigned admission state for a routing candidate.
+///
+/// Controls whether a candidate accepts new sessions, existing
+/// sessions only, or is excluded from routing entirely.  Unknown
+/// values from the overlay are rejected so hot reload retains the
+/// last-known-good snapshot.
+///
+/// [`NewAndExisting`]: AdmissionState::NewAndExisting
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum AdmissionState {
+    /// Accepts both new and existing sessions.
+    #[default]
+    NewAndExisting,
+
+    /// Accepts only existing sessions (bound via session affinity).
+    ExistingOnly,
+
+    /// Excluded from routing entirely.
+    Excluded,
+}
+
+impl AdmissionState {
+    /// Short string for metadata output.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::NewAndExisting => "new_and_existing",
+            Self::ExistingOnly => "existing_only",
+            Self::Excluded => "none",
+        }
+    }
+
+    /// Parse an admission state from an overlay string.
+    ///
+    /// Returns an error on unknown values so the overlay is rejected
+    /// and hot reload retains the last-known-good snapshot.
+    pub(crate) fn from_overlay_str(s: &str) -> Result<Self, String> {
+        match s {
+            "new_and_existing" => Ok(Self::NewAndExisting),
+            "existing_only" => Ok(Self::ExistingOnly),
+            "none" => Ok(Self::Excluded),
+            other => Err(format!("unknown admission_state: {other}")),
+        }
+    }
+}
+
 impl CapabilityKind {
     /// Short string for diagnostics and route metadata.
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::InferenceModel => "inference_model",
             Self::McpTool => "mcp_tool",
+        }
+    }
+
+    /// Parse a kind string from a Grid routing overlay document.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FilterError`] if the kind string is not recognised.
+    pub(crate) fn from_overlay_str(s: &str) -> Result<Self, FilterError> {
+        match s {
+            "inference_model" => Ok(Self::InferenceModel),
+            "mcp_tool" => Ok(Self::McpTool),
+            other => Err(format!("routing: unknown candidate kind: {other}").into()),
         }
     }
 }
@@ -105,13 +167,28 @@ fn default_fresh() -> bool {
 /// A validated route candidate ready for runtime matching.
 ///
 /// Created by [`validate_candidates`] from raw config entries.
-/// All string fields are bounded and non-blank.
+/// All string fields are bounded and non-blank.  Overlay-specific
+/// fields (`admission_state`, `rank`, `selection_tier`, `stable_id`)
+/// are populated by [`enrich_from_overlay`] after validation.
+///
+/// [`enrich_from_overlay`]: super::overlay::enrich_from_overlay
 #[derive(Debug)]
 pub(crate) struct RouteCandidate {
+    /// Producer-assigned admission state.
+    pub admission_state: AdmissionState,
+
     /// Cluster name to select.
     pub cluster: Arc<str>,
 
-    /// Whether this candidate is fresh.
+    /// Whether this candidate is fresh. Preserved from overlay/static config;
+    /// the configuration producer owns freshness ordering.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "preserved from overlay/static config; producer owns freshness ordering"
+        )
+    )]
     pub fresh: bool,
 
     /// Capability kind.
@@ -120,13 +197,30 @@ pub(crate) struct RouteCandidate {
     /// Capability name.
     pub name: Arc<str>,
 
+    /// Producer-assigned rank within the overlay (lower is better).
+    pub rank: Option<u32>,
+
+    /// Producer-assigned locality tier (e.g. `"same_region"`).
+    pub selection_tier: Option<Arc<str>>,
+
     /// Site that owns this capability.
     pub site: Arc<str>,
+
+    /// Deterministic identifier for session affinity binding.
+    pub stable_id: Arc<str>,
 }
 
 // -----------------------------------------------------------------------------
 // Validation
 // -----------------------------------------------------------------------------
+
+/// Build a deterministic stable ID from candidate identity fields.
+///
+/// Used as a fallback when the overlay does not provide an
+/// explicit `stable_id`.
+pub(crate) fn default_stable_id(kind: CapabilityKind, name: &str, site: &str, cluster: &str) -> Arc<str> {
+    Arc::from(format!("{}/{}/{}/{}", kind.as_str(), name, site, cluster))
+}
 
 /// Validate and build the candidate list from raw config entries.
 ///
@@ -164,12 +258,17 @@ pub(crate) fn validate_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<Route
             .into());
         }
 
+        let stable_id = default_stable_id(c.kind, &c.name, &c.site, &c.cluster);
         candidates.push(RouteCandidate {
+            admission_state: AdmissionState::default(),
             cluster: Arc::from(c.cluster.as_str()),
             fresh: c.fresh,
             kind: c.kind,
             name: Arc::from(c.name.as_str()),
+            rank: None,
+            selection_tier: None,
             site: Arc::from(c.site.as_str()),
+            stable_id,
         });
     }
 
@@ -195,6 +294,11 @@ pub(crate) fn validate_model_header(raw: &str) -> Result<http::header::HeaderNam
 /// Validate a local site identifier.
 pub(crate) fn validate_local_site(value: &str) -> Result<(), FilterError> {
     validate_name("local_site", value)
+}
+
+/// Validate a cluster identifier used outside an inline candidate.
+pub(crate) fn validate_cluster_name(field: &str, value: &str) -> Result<(), FilterError> {
+    validate_name(field, value)
 }
 
 /// Validate a bounded, non-blank identifier.
