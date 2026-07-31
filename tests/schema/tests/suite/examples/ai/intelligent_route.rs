@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Praxis Contributors
 
-//! Grid route filter example configuration tests.
+//! Intelligent route filter example configuration tests.
 //!
-//! These tests verify that the `grid_route` filter example configs parse
+//! These tests verify that the `intelligent_route` filter example configs parse
 //! and route correctly end-to-end.  The filter is registered by
-//! `praxis-ai-proxy` and is AI/Grid-specific — it is not a Praxis core builtin.
+//! `praxis-ai-proxy` and is AI-specific — it is not a Praxis core builtin.
 
 use praxis_core::config::Config;
 use praxis_test_utils::{free_port, http_post, start_backend, start_proxy};
@@ -15,7 +15,7 @@ use praxis_test_utils::{free_port, http_post, start_backend, start_proxy};
 // -----------------------------------------------------------------------------
 
 #[test]
-fn grid_route_inference_routes_known_local_model() {
+fn intelligent_route_inference_routes_known_local_model() {
     let local_port = start_backend("granite-response");
     let remote_port = start_backend("llama-response");
     let proxy_port = free_port();
@@ -34,7 +34,7 @@ fn grid_route_inference_routes_known_local_model() {
 }
 
 #[test]
-fn grid_route_inference_routes_known_remote_model() {
+fn intelligent_route_inference_routes_known_remote_model() {
     let local_port = start_backend("granite-response");
     let remote_port = start_backend("llama-response");
     let proxy_port = free_port();
@@ -53,7 +53,7 @@ fn grid_route_inference_routes_known_remote_model() {
 }
 
 #[test]
-fn grid_route_inference_rejects_unknown_model_with_404() {
+fn intelligent_route_inference_rejects_unknown_model_with_404() {
     let local_port = start_backend("granite-response");
     let remote_port = start_backend("llama-response");
     let proxy_port = free_port();
@@ -75,7 +75,7 @@ fn grid_route_inference_rejects_unknown_model_with_404() {
 // -----------------------------------------------------------------------------
 
 #[test]
-fn grid_route_mcp_routes_known_tool() {
+fn intelligent_route_mcp_routes_known_tool() {
     let local_port = start_backend("code-search-response");
     let remote_port = start_backend("weather-response");
     let proxy_port = free_port();
@@ -97,7 +97,7 @@ fn grid_route_mcp_routes_known_tool() {
 // Test Utilities
 // -----------------------------------------------------------------------------
 
-/// Build YAML config that mirrors the grid-route-inference.yaml example
+/// Build YAML config that mirrors the intelligent-route-inference.yaml example
 /// with dynamic ports substituted in.
 fn make_inference_yaml(proxy_port: u16, local_port: u16, remote_port: u16) -> String {
     format!(
@@ -113,7 +113,7 @@ filter_chains:
       - filter: json_body_field
         field: model
         header: X-Model
-      - filter: grid_route
+      - filter: intelligent_route
         local_site: site-a
         model_header: X-Model
         candidates:
@@ -139,7 +139,7 @@ filter_chains:
     )
 }
 
-/// Build YAML config that mirrors the grid-route-mcp.yaml example
+/// Build YAML config that mirrors the intelligent-route-mcp.yaml example
 /// with dynamic ports substituted in.
 fn make_mcp_yaml(proxy_port: u16, local_port: u16, remote_port: u16) -> String {
     format!(
@@ -153,7 +153,7 @@ filter_chains:
   - name: main
     filters:
       - filter: mcp
-      - filter: grid_route
+      - filter: intelligent_route
         local_site: site-a
         candidates:
           - kind: mcp_tool

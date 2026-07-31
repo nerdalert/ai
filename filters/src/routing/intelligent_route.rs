@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Praxis Contributors
 
-//! Grid route filter: selects an upstream cluster for the request
-//! based on the inference model name or MCP tool name.
+//! Intelligent route filter: selects an upstream cluster for the
+//! request based on the inference model name or MCP tool name.
 //!
 //! **Lookup precedence:** if `mcp.method` filter metadata exists, the
 //! filter attempts MCP tool routing first.  `tools/call` with a valid
@@ -41,10 +41,10 @@ const LOCAL_PREFERENCE: i32 = 10;
 // Config
 // -----------------------------------------------------------------------------
 
-/// Deserialized YAML config for the grid route filter.
+/// Deserialized YAML config for the intelligent route filter.
 ///
 /// ```yaml
-/// filter: grid_route
+/// filter: intelligent_route
 /// local_site: site-a
 /// model_header: x-model
 /// candidates:
@@ -55,7 +55,7 @@ const LOCAL_PREFERENCE: i32 = 10;
 /// ```
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct GridRouteConfig {
+struct IntelligentRouteConfig {
     /// Static list of route candidates.
     candidates: Vec<CandidateConfig>,
 
@@ -73,16 +73,17 @@ fn default_model_header() -> String {
 }
 
 // -----------------------------------------------------------------------------
-// GridRouteFilter
+// IntelligentRouteFilter
 // -----------------------------------------------------------------------------
 
-/// Selects an upstream cluster from a static site/capability descriptor
+/// Selects an upstream cluster from an ordered candidate configuration
 /// by matching either an inference model name or MCP tool name.
 ///
 /// This filter is registered by the AI proxy (not Praxis core) because it
-/// encodes AI/Grid-specific routing semantics: candidate freshness preference,
+/// encodes AI-specific routing semantics: candidate freshness preference,
 /// local-site scoring, and MCP tool-call routing.  Praxis core provides the
-/// generic filter runtime; this filter adds the Grid candidate model on top.
+/// generic filter runtime; this filter adds the candidate selection model
+/// on top.
 ///
 /// **Behavior:**
 /// - If `ctx.cluster` is already set by an earlier filter, the selection is preserved and no metadata is written.
@@ -97,15 +98,15 @@ fn default_model_header() -> String {
 /// configured candidate wins on equal scores.
 ///
 /// **Metadata:** on successful selection, bounded in-process filter
-/// metadata is written under the `grid.route.` namespace (`kind`, `name`,
-/// `site`, `cluster`, `local_site`).  No HTTP forwarding headers are
-/// written.  No request-time database, control-plane, or metrics
+/// metadata is written under the `intelligent_route.` namespace (`kind`,
+/// `name`, `site`, `cluster`, `local_site`).  No HTTP forwarding headers
+/// are written.  No request-time database, control-plane, or metrics
 /// lookups are performed.
 ///
 /// **MCP lookup:** if `mcp.method` filter metadata is set to `tools/call`
 /// and `mcp.name` is present, `mcp_tool` candidates are matched.
 /// Other MCP methods (`initialize`, `notifications/*`, etc.) skip routing.
-pub struct GridRouteFilter {
+pub struct IntelligentRouteFilter {
     /// Validated route candidates.
     candidates: Vec<RouteCandidate>,
     /// Local site identifier for scoring and metadata.
@@ -114,15 +115,15 @@ pub struct GridRouteFilter {
     model_header: http::header::HeaderName,
 }
 
-impl GridRouteFilter {
-    /// Create a grid route filter from parsed YAML config.
+impl IntelligentRouteFilter {
+    /// Create an intelligent route filter from parsed YAML config.
     ///
     /// # Errors
     ///
     /// Returns [`FilterError`] if the candidate list is empty,
     /// any name field is blank, or the model header is invalid.
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let cfg: GridRouteConfig = parse_filter_config("grid_route", config)?;
+        let cfg: IntelligentRouteConfig = parse_filter_config("intelligent_route", config)?;
 
         descriptor::validate_local_site(&cfg.local_site)?;
         let model_header = descriptor::validate_model_header(&cfg.model_header)?;
@@ -137,24 +138,25 @@ impl GridRouteFilter {
 }
 
 #[async_trait]
-impl HttpFilter for GridRouteFilter {
+impl HttpFilter for IntelligentRouteFilter {
     fn name(&self) -> &'static str {
-        "grid_route"
+        "intelligent_route"
     }
 
-    /// `grid_route` selects `ctx.cluster` from configured candidates.
+    /// `intelligent_route` selects `ctx.cluster` from configured candidates.
     ///
     /// Returning `true` here tells the Praxis pipeline validator that this
     /// filter satisfies the "cluster-selecting filter before `load_balancer`"
     /// requirement.  Without this, the validator would reject pipelines that
-    /// use `grid_route → load_balancer` without an intervening `router`.
+    /// use `intelligent_route → load_balancer` without an intervening
+    /// `router`.
     fn selects_cluster(&self) -> bool {
         true
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         if ctx.cluster.is_some() {
-            tracing::debug!("grid_route: cluster already set; preserving");
+            tracing::debug!("intelligent_route: cluster already set; preserving");
             return Ok(FilterAction::Continue);
         }
 
@@ -174,13 +176,13 @@ impl HttpFilter for GridRouteFilter {
                 cluster = &*c.cluster,
                 fresh = c.fresh,
                 score = score_candidate(c, &self.local_site),
-                "grid_route: selected"
+                "intelligent_route: selected"
             );
             ctx.cluster = Some(Arc::clone(&c.cluster));
             record_route_decision(ctx, &self.local_site, c);
             Ok(FilterAction::Continue)
         } else {
-            tracing::debug!(kind = kind.as_str(), name = %name, "grid_route: no candidate");
+            tracing::debug!(kind = kind.as_str(), name = %name, "intelligent_route: no candidate");
             Ok(FilterAction::Reject(Rejection::status(404)))
         }
     }
@@ -225,15 +227,18 @@ fn extract_lookup(ctx: &HttpFilterContext<'_>, model_header: &http::header::Head
 /// protocol message, not an inference request.
 fn extract_mcp_lookup(ctx: &HttpFilterContext<'_>, method: &str) -> Lookup {
     if method != "tools/call" {
-        tracing::debug!(method = method, "grid_route: non-tools/call MCP method; skipping");
+        tracing::debug!(
+            method = method,
+            "intelligent_route: non-tools/call MCP method; skipping"
+        );
         return Lookup::Skip;
     }
     let Some(name) = ctx.get_metadata("mcp.name") else {
-        tracing::debug!("grid_route: tools/call without mcp.name; rejecting");
+        tracing::debug!("intelligent_route: tools/call without mcp.name; rejecting");
         return Lookup::Invalid;
     };
     if name.trim().is_empty() || name.len() > MAX_HEADER_VALUE_LEN {
-        tracing::debug!("grid_route: mcp.name blank or oversized; rejecting");
+        tracing::debug!("intelligent_route: mcp.name blank or oversized; rejecting");
         return Lookup::Invalid;
     }
     Lookup::Route {
@@ -245,15 +250,15 @@ fn extract_mcp_lookup(ctx: &HttpFilterContext<'_>, method: &str) -> Lookup {
 /// Extract an inference model lookup from the promoted model header.
 fn extract_model_lookup(ctx: &HttpFilterContext<'_>, model_header: &http::header::HeaderName) -> Lookup {
     let Some(value) = ctx.request.headers.get(model_header) else {
-        tracing::debug!("grid_route: no model header; skipping");
+        tracing::debug!("intelligent_route: no model header; skipping");
         return Lookup::Skip;
     };
     let Ok(model) = value.to_str() else {
-        tracing::debug!("grid_route: model header is not valid UTF-8; rejecting");
+        tracing::debug!("intelligent_route: model header is not valid UTF-8; rejecting");
         return Lookup::Invalid;
     };
     if model.trim().is_empty() || model.len() > MAX_HEADER_VALUE_LEN {
-        tracing::debug!("grid_route: model header blank or oversized; rejecting");
+        tracing::debug!("intelligent_route: model header blank or oversized; rejecting");
         return Lookup::Invalid;
     }
     Lookup::Route {
@@ -309,15 +314,15 @@ fn score_candidate(candidate: &RouteCandidate, local_site: &str) -> i32 {
 
 /// Write bounded route-decision metadata on successful selection.
 ///
-/// Keys use `grid.route.` namespace. All values are bounded by the
-/// existing `set_metadata` limits.  No HTTP forwarding headers are
+/// Keys use `intelligent_route.` namespace. All values are bounded by
+/// the existing `set_metadata` limits.  No HTTP forwarding headers are
 /// written by this function.
 fn record_route_decision(ctx: &mut HttpFilterContext<'_>, local_site: &Arc<str>, candidate: &RouteCandidate) {
-    ctx.set_metadata("grid.route.kind", candidate.kind.as_str());
-    ctx.set_metadata("grid.route.name", &*candidate.name);
-    ctx.set_metadata("grid.route.site", &*candidate.site);
-    ctx.set_metadata("grid.route.cluster", &*candidate.cluster);
-    ctx.set_metadata("grid.route.local_site", &**local_site);
+    ctx.set_metadata("intelligent_route.kind", candidate.kind.as_str());
+    ctx.set_metadata("intelligent_route.name", &*candidate.name);
+    ctx.set_metadata("intelligent_route.site", &*candidate.site);
+    ctx.set_metadata("intelligent_route.cluster", &*candidate.cluster);
+    ctx.set_metadata("intelligent_route.local_site", &**local_site);
 }
 
 // -----------------------------------------------------------------------------
@@ -540,8 +545,8 @@ mod tests {
             Some("grid-site-c"),
             "cluster should be mcp_tool cluster"
         );
-        assert_eq!(ctx.get_metadata("grid.route.kind"), Some("mcp_tool"));
-        assert_eq!(ctx.get_metadata("grid.route.name"), Some("weather"));
+        assert_eq!(ctx.get_metadata("intelligent_route.kind"), Some("mcp_tool"));
+        assert_eq!(ctx.get_metadata("intelligent_route.name"), Some("weather"));
     }
 
     #[tokio::test]
@@ -785,11 +790,11 @@ mod tests {
         let mut ctx = crate::test_utils::make_filter_context(&req);
 
         let _unused = f.on_request(&mut ctx).await.unwrap();
-        assert_eq!(ctx.get_metadata("grid.route.cluster"), Some("local-inf"));
-        assert_eq!(ctx.get_metadata("grid.route.kind"), Some("inference_model"));
-        assert_eq!(ctx.get_metadata("grid.route.name"), Some("llama"));
-        assert_eq!(ctx.get_metadata("grid.route.site"), Some("site-a"));
-        assert_eq!(ctx.get_metadata("grid.route.local_site"), Some("site-a"));
+        assert_eq!(ctx.get_metadata("intelligent_route.cluster"), Some("local-inf"));
+        assert_eq!(ctx.get_metadata("intelligent_route.kind"), Some("inference_model"));
+        assert_eq!(ctx.get_metadata("intelligent_route.name"), Some("llama"));
+        assert_eq!(ctx.get_metadata("intelligent_route.site"), Some("site-a"));
+        assert_eq!(ctx.get_metadata("intelligent_route.local_site"), Some("site-a"));
     }
 
     #[tokio::test]
@@ -800,8 +805,8 @@ mod tests {
         let mut ctx = crate::test_utils::make_filter_context(&req);
 
         let _unused = f.on_request(&mut ctx).await.unwrap();
-        assert_eq!(ctx.get_metadata("grid.route.cluster"), Some("local-inf"));
-        assert_eq!(ctx.get_metadata("grid.route.local_site"), Some("site-a"));
+        assert_eq!(ctx.get_metadata("intelligent_route.cluster"), Some("local-inf"));
+        assert_eq!(ctx.get_metadata("intelligent_route.local_site"), Some("site-a"));
     }
 
     #[tokio::test]
@@ -812,8 +817,8 @@ mod tests {
         let mut ctx = crate::test_utils::make_filter_context(&req);
 
         let _unused = f.on_request(&mut ctx).await.unwrap();
-        assert_eq!(ctx.get_metadata("grid.route.cluster"), Some("remote-gw"));
-        assert_eq!(ctx.get_metadata("grid.route.site"), Some("site-b"));
+        assert_eq!(ctx.get_metadata("intelligent_route.cluster"), Some("remote-gw"));
+        assert_eq!(ctx.get_metadata("intelligent_route.site"), Some("site-b"));
     }
 
     #[tokio::test]
@@ -858,7 +863,7 @@ mod tests {
         let action = f.on_request(&mut ctx).await.unwrap();
         assert!(matches!(action, FilterAction::Continue));
         assert!(
-            ctx.get_metadata("grid.route.kind").is_none(),
+            ctx.get_metadata("intelligent_route.kind").is_none(),
             "preserved cluster path should not write route metadata"
         );
     }
@@ -867,30 +872,30 @@ mod tests {
 
     fn assert_no_route_metadata(ctx: &HttpFilterContext<'_>) {
         assert!(
-            ctx.get_metadata("grid.route.kind").is_none(),
-            "grid.route.kind should be absent"
+            ctx.get_metadata("intelligent_route.kind").is_none(),
+            "intelligent_route.kind should be absent"
         );
         assert!(
-            ctx.get_metadata("grid.route.name").is_none(),
-            "grid.route.name should be absent"
+            ctx.get_metadata("intelligent_route.name").is_none(),
+            "intelligent_route.name should be absent"
         );
         assert!(
-            ctx.get_metadata("grid.route.site").is_none(),
-            "grid.route.site should be absent"
+            ctx.get_metadata("intelligent_route.site").is_none(),
+            "intelligent_route.site should be absent"
         );
         assert!(
-            ctx.get_metadata("grid.route.cluster").is_none(),
-            "grid.route.cluster should be absent"
+            ctx.get_metadata("intelligent_route.cluster").is_none(),
+            "intelligent_route.cluster should be absent"
         );
         assert!(
-            ctx.get_metadata("grid.route.local_site").is_none(),
-            "grid.route.local_site should be absent"
+            ctx.get_metadata("intelligent_route.local_site").is_none(),
+            "intelligent_route.local_site should be absent"
         );
     }
 
     fn parse(yaml: &str) -> Result<Box<dyn HttpFilter>, FilterError> {
         let val: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
-        GridRouteFilter::from_config(&val)
+        IntelligentRouteFilter::from_config(&val)
     }
 
     fn parse_err(yaml: &str) -> FilterError {

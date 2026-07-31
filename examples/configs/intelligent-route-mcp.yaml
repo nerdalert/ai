@@ -1,4 +1,4 @@
-# Grid Route: MCP Tool Routing
+# Intelligent Route: MCP Tool Routing
 #
 # Routes MCP `tools/call` requests to the cluster that owns the
 # requested tool, using the `mcp.name` metadata set by the `mcp` filter.
@@ -11,10 +11,10 @@
 # without routing; only `tools/call` triggers `mcp_tool` matching.
 #
 # This filter is registered by praxis-ai-proxy, not Praxis core, because
-# it encodes AI/Grid-specific routing semantics.
+# it encodes AI-specific routing semantics.
 #
 # Usage:
-#   cargo run -p praxis-ai-proxy -- -c examples/configs/grid-route-mcp.yaml
+#   cargo run -p praxis-ai-proxy -- -c examples/configs/intelligent-route-mcp.yaml
 
 listeners:
   - name: proxy
@@ -31,7 +31,7 @@ filter_chains:
 
       # Route tools/call requests to the cluster that owns the tool.
       # Other MCP methods pass through without routing.
-      - filter: grid_route
+      - filter: intelligent_route
         local_site: site-a
         candidates:
           - kind: mcp_tool
@@ -46,7 +46,7 @@ filter_chains:
             cluster: tools-site-a
             fresh: true
 
-      # Forward to whichever cluster grid_route selected.
+      # Forward to whichever cluster intelligent_route selected.
       - filter: load_balancer
         clusters:
           - name: tools-site-a

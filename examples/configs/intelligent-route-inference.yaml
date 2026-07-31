@@ -1,10 +1,10 @@
-# Grid Route: Inference Model Routing
+# Intelligent Route: Inference Model Routing
 #
 # Routes requests to different upstream clusters based on the inference
 # model name extracted from a configured request header.  The header
 # value is set by an earlier filter such as `json_body_field`.
 #
-# `grid_route` selects a candidate by static scoring and writes the
+# `intelligent_route` selects a candidate by static scoring and writes the
 # cluster name into `ctx.cluster`.  The downstream `load_balancer` reads
 # that cluster.  No `router` filter is required between them.
 #
@@ -12,10 +12,10 @@
 # First configured candidate wins on equal score.
 #
 # This filter is registered by praxis-ai-proxy, not Praxis core, because
-# it encodes AI/Grid-specific routing semantics.
+# it encodes AI-specific routing semantics.
 #
 # Usage:
-#   cargo run -p praxis-ai-proxy -- -c examples/configs/grid-route-inference.yaml
+#   cargo run -p praxis-ai-proxy -- -c examples/configs/intelligent-route-inference.yaml
 
 listeners:
   - name: proxy
@@ -33,7 +33,7 @@ filter_chains:
 
       # Route to the cluster that serves the requested model.
       # Selects by highest score: fresh > stale, local > remote.
-      - filter: grid_route
+      - filter: intelligent_route
         local_site: site-a
         model_header: X-Model
         candidates:
@@ -49,7 +49,7 @@ filter_chains:
             cluster: llama-remote
             fresh: true
 
-      # Forward to whichever cluster grid_route selected.
+      # Forward to whichever cluster intelligent_route selected.
       - filter: load_balancer
         clusters:
           - name: granite-local

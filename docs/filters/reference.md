@@ -50,12 +50,6 @@ see the [Praxis core filter reference][core-ref].
 | [`a2a`](a2a.md) | Extracts A2A protocol metadata from JSON-RPC request bodies and promotes method, family, task ID, streaming detection, and version to request headers, filter results, and durable metadata for routing. |
 | [`mcp`](mcp.md) | Extracts MCP protocol metadata from JSON-RPC request bodies and promotes method, tool/resource/prompt name, JSON-RPC kind, protocol version, and session presence to request headers/filter results; stores session ID in durable metadata. |
 
-### Grid
-
-| Filter | Description |
-|--------|-------------|
-| [`grid_route`](grid_route.md) | Selects an upstream cluster from a static site/capability descriptor by matching either an inference model name or MCP tool name. |
-
 ### Guardrails
 
 | Filter | Description |
@@ -73,6 +67,12 @@ see the [Praxis core filter reference][core-ref].
 | Filter | Description |
 |--------|-------------|
 | [`prompt_enrich`](prompt_enrich.md) | Injects statically configured messages into the `messages` array of OpenAI-compatible chat completion request bodies. |
+
+### Routing
+
+| Filter | Description |
+|--------|-------------|
+| [`intelligent_route`](intelligent_route.md) | Selects an upstream cluster from an ordered candidate configuration by matching either an inference model name or MCP tool name. |
 
 ### Time To First Token
 
