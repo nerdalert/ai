@@ -13,11 +13,11 @@ const CANDIDATE_ID: &str = "inference_model/mock-model/site-us-west/provider-us-
 /// Resolve the complete AI pipeline, including provider-boundary validation.
 fn resolve(yaml: &str) -> Result<(), String> {
     let config = Config::from_yaml(yaml).map_err(|error| error.to_string())?;
-    let registry = praxis_ai::build_full_registry();
     let health = Arc::new(HashMap::new());
     let kv_stores = praxis_core::kv::KvStoreRegistry::new();
     let subrequest_client =
         praxis_core::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(8, None));
+    let registry = praxis_ai::build_full_registry(&subrequest_client);
     praxis_ai::resolve_pipelines(&config, &registry, &health, &kv_stores, &subrequest_client)
         .map(|_pipelines| ())
         .map_err(|error| error.to_string())
