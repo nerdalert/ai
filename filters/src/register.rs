@@ -7,8 +7,8 @@ use praxis_core::subrequest::SubRequestClient;
 use praxis_filter::FilterRegistry;
 
 use crate::{
-    A2aFilter, AiGuardrailsFilter, IntelligentRouteFilter, McpFilter, ModelToHeaderFilter, PromptEnrichFilter,
-    TimeToFirstTokenFilter, TokenCountFilter, TokenUsageHeadersFilter,
+    A2aFilter, AiGuardrailsFilter, CredentialInjectFilter, IntelligentRouteFilter, McpFilter, ModelToHeaderFilter,
+    PromptEnrichFilter, ProviderRouteFilter, TimeToFirstTokenFilter, TokenCountFilter, TokenUsageHeadersFilter,
 };
 
 /// Register all in-tree AI HTTP filters into `registry`.
@@ -101,6 +101,28 @@ fn register_routing_filters(registry: &mut FilterRegistry) {
         @register registry,
         http "intelligent_route" => IntelligentRouteFilter::from_config
     );
+    register_routing_security_filter(registry, "provider_route", ProviderRouteFilter::from_config);
+    register_routing_security_filter(registry, "credential_inject", CredentialInjectFilter::from_config);
+}
+
+/// Register a routing HTTP filter as security-critical.
+#[expect(
+    clippy::type_complexity,
+    reason = "single-use registration helper; a type alias adds indirection"
+)]
+#[expect(clippy::panic, reason = "duplicate filter registration is a fatal configuration bug")]
+fn register_routing_security_filter(
+    registry: &mut FilterRegistry,
+    name: &'static str,
+    factory: fn(&serde_yaml::Value) -> Result<Box<dyn praxis_filter::HttpFilter>, praxis_filter::FilterError>,
+) {
+    registry
+        .register_with_class(
+            name,
+            praxis_filter::FilterFactory::Http(std::sync::Arc::new(factory)),
+            praxis_filter::SecurityClass::Security,
+        )
+        .unwrap_or_else(|_| panic!("duplicate filter name: '{name}'"));
 }
 
 /// Register Anthropic-specific filters.
@@ -324,6 +346,13 @@ mod tests {
             names.contains(&"intelligent_route"),
             "expected intelligent_route in registry"
         );
+        assert!(names.contains(&"provider_route"), "expected provider_route in registry");
+        assert!(
+            names.contains(&"credential_inject"),
+            "expected credential_inject in registry"
+        );
+        assert!(registry.is_security_filter("provider_route"));
+        assert!(registry.is_security_filter("credential_inject"));
         assert!(
             names.contains(&"anthropic_validate"),
             "expected anthropic filter in registry"
