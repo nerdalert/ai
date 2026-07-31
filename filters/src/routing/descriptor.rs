@@ -221,7 +221,9 @@ fn validate_name(field: &str, value: &str) -> Result<(), FilterError> {
 mod tests {
     use super::*;
 
-    // ---- Valid configs ----
+    // -------------------------------------------------------------------------
+    // Valid Configs
+    // -------------------------------------------------------------------------
 
     #[test]
     fn valid_minimal_inference_candidate() {
@@ -259,7 +261,9 @@ mod tests {
         assert!(!candidates[0].fresh);
     }
 
-    // ---- Rejections ----
+    // -------------------------------------------------------------------------
+    // Rejections
+    // -------------------------------------------------------------------------
 
     #[test]
     fn empty_candidates_rejected() {
@@ -390,7 +394,9 @@ mod tests {
         assert!(err.is_err(), "unknown fields should be rejected");
     }
 
-    // ---- Model header validation ----
+    // -------------------------------------------------------------------------
+    // Model Header Validation
+    // -------------------------------------------------------------------------
 
     #[test]
     fn valid_model_header() {
@@ -409,7 +415,9 @@ mod tests {
         assert!(err.to_string().contains("reserved"), "{err}");
     }
 
-    // ---- Local site validation ----
+    // -------------------------------------------------------------------------
+    // Local Site Validation
+    // -------------------------------------------------------------------------
 
     #[test]
     fn valid_local_site() {
@@ -422,7 +430,9 @@ mod tests {
         assert!(err.to_string().contains("local_site must be"), "{err}");
     }
 
-    // ---- Test utilities ----
+    // -------------------------------------------------------------------------
+    // Test Utilities
+    // -------------------------------------------------------------------------
 
     fn candidate(kind_str: &str, name: &str, site: &str, cluster: &str) -> CandidateConfig {
         let kind: CapabilityKind = serde_yaml::from_str(&format!("\"{kind_str}\"")).unwrap();

@@ -28,6 +28,10 @@ use serde::Deserialize;
 
 use super::descriptor::{self, CandidateConfig, CapabilityKind, RouteCandidate};
 
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
 /// Maximum length for header values read from the request.
 const MAX_HEADER_VALUE_LEN: usize = 256;
 
