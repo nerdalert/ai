@@ -127,6 +127,8 @@ pub struct ProviderRouteFilter {
     model_header: HeaderName,
     /// Provider-owned identifier for observability.
     provider_id: Arc<str>,
+    /// Prevalidated provider attribution header.
+    provider_id_header: HeaderValue,
     /// Candidate-to-route map.
     routes: HashMap<Arc<str>, ProviderRoute>,
 }
@@ -144,6 +146,8 @@ impl ProviderRouteFilter {
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: ProviderRouteFilterConfig = parse_filter_config("provider_route", config)?;
         validate_value("provider_id", &cfg.provider_id)?;
+        let provider_id_header = HeaderValue::from_str(&cfg.provider_id)
+            .map_err(|error| FilterError::from(format!("provider_route: invalid provider_id header: {error}")))?;
         if cfg.routes.is_empty() || cfg.routes.len() > MAX_PROVIDER_ROUTES {
             return Err(format!("provider_route: routes must contain 1-{MAX_PROVIDER_ROUTES} entries").into());
         }
@@ -168,6 +172,7 @@ impl ProviderRouteFilter {
             emit_demo_attribution: cfg.emit_demo_attribution,
             model_header,
             provider_id: Arc::from(cfg.provider_id.as_str()),
+            provider_id_header,
             routes,
         }))
     }
@@ -220,7 +225,7 @@ impl HttpFilter for ProviderRouteFilter {
             ctx.set_metadata(PROVIDER_ROUTE_OVERLAY_REVISION, revision);
         }
         set_credential_metadata(ctx, route.credential.as_ref());
-        set_provider_headers(ctx, &self.provider_id, &request_id, overlay_revision.as_deref())?;
+        set_provider_headers(ctx, &self.provider_id_header, &request_id, overlay_revision.as_deref())?;
 
         Ok(FilterAction::Continue)
     }
@@ -232,11 +237,10 @@ impl HttpFilter for ProviderRouteFilter {
         let Some(response) = ctx.response_header.as_mut() else {
             return Ok(FilterAction::Continue);
         };
-        let value = HeaderValue::from_str(self.provider_id.as_ref())
-            .map_err(|e| FilterError::from(format!("provider_route: invalid provider attribution: {e}")))?;
-        response
-            .headers
-            .insert(HeaderName::from_static(PROVIDER_ATTRIBUTION_RESPONSE_HEADER), value);
+        response.headers.insert(
+            HeaderName::from_static(PROVIDER_ATTRIBUTION_RESPONSE_HEADER),
+            self.provider_id_header.clone(),
+        );
         ctx.response_headers_modified = true;
         Ok(FilterAction::Continue)
     }
@@ -266,7 +270,7 @@ fn strip_edge_headers(ctx: &mut HttpFilterContext<'_>) {
 /// Set provider request ID and attribution headers on the backend request.
 fn set_provider_headers(
     ctx: &mut HttpFilterContext<'_>,
-    provider_id: &str,
+    provider_id: &HeaderValue,
     request_id: &str,
     overlay_revision: Option<&str>,
 ) -> Result<(), FilterError> {
@@ -277,8 +281,7 @@ fn set_provider_headers(
     ));
     ctx.request_headers_to_set.push((
         HeaderName::from_static(PROVIDER_ATTRIBUTION_HEADER),
-        HeaderValue::from_str(provider_id)
-            .map_err(|e| FilterError::from(format!("provider_route: invalid provider attribution: {e}")))?,
+        provider_id.clone(),
     ));
     if let Some(revision) = overlay_revision {
         ctx.request_headers_to_set.push((
@@ -902,6 +905,16 @@ mod tests {
         let yaml = "provider_id: ''\nroutes:\n  - candidate_id: a\n    model: m\n    paths: [/x]\n    cluster: c\n";
         let val: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
         assert!(ProviderRouteFilter::from_config(&val).is_err());
+    }
+
+    #[test]
+    fn invalid_provider_id_header_rejected_at_construction() {
+        let yaml = "provider_id: \"bad\\0value\"\nroutes:\n  - candidate_id: a\n    model: m\n    paths: [/x]\n    cluster: c\n";
+        let val: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let error = ProviderRouteFilter::from_config(&val)
+            .err()
+            .expect("invalid header value must fail construction");
+        assert!(error.to_string().contains("invalid provider_id header"), "{error}");
     }
 
     #[test]
