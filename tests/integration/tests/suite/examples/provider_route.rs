@@ -131,6 +131,16 @@ fn provider_route_example_accepts_authenticated_route_and_replaces_credential() 
         "caller authorization must not reach the private backend: {body}"
     );
 
+    let unauthenticated_client = certificates.raw_tls_client_config();
+    assert!(
+        praxis_test_utils::tls_connection_rejected(
+            proxy.addr(),
+            provider_request(CANDIDATE_ID).as_bytes(),
+            &unauthenticated_client,
+        ),
+        "provider listener must reject clients without a certificate"
+    );
+
     let rejected = praxis_test_utils::https_send(proxy.addr(), &provider_request("unknown-candidate"), &request_client);
     assert_eq!(
         praxis_test_utils::parse_status(&rejected),
