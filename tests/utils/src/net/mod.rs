@@ -5,6 +5,8 @@
 //! checks, mock backends, HTTP clients, and TLS utilities.
 
 pub mod backend;
+#[cfg(feature = "llmd-ext-proc")]
+pub mod ext_proc_mock;
 pub mod http_client;
 pub mod port;
 pub mod postgres;
@@ -19,6 +21,8 @@ pub use backend::{
     start_echo_backend, start_header_echo_backend, start_scripted_websocket_backend,
     start_scripted_websocket_backend_turns, start_stateful_backend, start_uri_echo_backend,
 };
+#[cfg(feature = "llmd-ext-proc")]
+pub use ext_proc_mock::{MockProcessorGuard, start_mock_routing_processor};
 pub use http_client::{
     http_get, http_get_retry, http_get_v6, http_post, http_send, json_post, parse_body, parse_header, parse_header_all,
     parse_status,

@@ -9,7 +9,7 @@ description = "llm-d environment integration tests for Praxis AI"
 
 [features]
 default = []
-llmd-ext-proc = ["praxis-ai-proxy/llmd-ext-proc"]
+llmd-ext-proc = ["praxis-ai-proxy/llmd-ext-proc", "praxis-test-utils/llmd-ext-proc"]
 
 [lints]
 workspace = true
@@ -21,13 +21,7 @@ harness = true
 required-features = ["llmd-ext-proc"]
 
 [dev-dependencies]
-async-trait = { workspace = true }
-futures = { workspace = true }
 praxis-ai-proxy = { workspace = true }
-praxis-ai-llmd-ext-proc = { workspace = true }
 praxis-core = { workspace = true }
 praxis-test-utils = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "sync"] }
-tokio-stream = { workspace = true }
-tonic = { workspace = true }
