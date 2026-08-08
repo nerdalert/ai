@@ -17,6 +17,8 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 mod commands;
 mod dump;
+#[cfg(feature = "otel")]
+mod telemetry;
 
 use clap::Parser;
 use tracing::info;
@@ -70,6 +72,9 @@ fn main() {
 
     let config_path = praxis_ai::resolve_config_path(explicit.as_deref());
     let config = praxis_ai::load_config(explicit.as_deref()).unwrap_or_else(|e| praxis_ai::fatal(&e));
+    #[cfg(feature = "otel")]
+    telemetry::init_tracing(&config).unwrap_or_else(|e| praxis_ai::fatal(&e));
+    #[cfg(not(feature = "otel"))]
     praxis_ai::init_tracing(&config).unwrap_or_else(|e| praxis_ai::fatal(&e));
     info!("starting server");
     praxis_ai::run_server(config, config_path)

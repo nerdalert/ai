@@ -193,6 +193,10 @@ impl HttpFilter for ProviderRouteFilter {
         reason = "keeps the fail-closed provider-boundary decision atomic"
     )]
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        #[cfg(feature = "otel")]
+        let _otel_guard =
+            crate::otel::enter_server_span(&ctx.request.method, ctx.request.uri.path(), &ctx.request.headers);
+
         strip_edge_headers(ctx);
 
         let Some(candidate_id) = request_header(ctx, SELECTED_CANDIDATE_HEADER).map(str::to_owned) else {
@@ -213,6 +217,18 @@ impl HttpFilter for ProviderRouteFilter {
         };
         if route.model.as_ref() != model || !route.paths.iter().any(|path| path.as_ref() == ctx.request.uri.path()) {
             return Ok(FilterAction::Reject(Rejection::status(404)));
+        }
+
+        #[cfg(feature = "otel")]
+        {
+            let _route_span = tracing::info_span!(
+                "provider.validate",
+                "provider.id" = %*self.provider_id,
+                "provider.candidate_id" = %candidate_id,
+                "provider.model" = %model,
+                "provider.cluster" = %*route.cluster,
+            )
+            .entered();
         }
 
         ctx.cluster = Some(Arc::clone(&route.cluster));

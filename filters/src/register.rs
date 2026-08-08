@@ -8,7 +8,8 @@ use praxis_filter::FilterRegistry;
 
 use crate::{
     A2aFilter, AiGuardrailsFilter, CredentialInjectFilter, IntelligentRouteFilter, McpFilter, ModelToHeaderFilter,
-    PromptEnrichFilter, ProviderRouteFilter, TimeToFirstTokenFilter, TokenCountFilter, TokenUsageHeadersFilter,
+    OtelContextFilter, PromptEnrichFilter, ProviderRouteFilter, TimeToFirstTokenFilter, TokenCountFilter,
+    TokenUsageHeadersFilter,
 };
 
 /// Register all in-tree AI HTTP filters into `registry`.
@@ -103,6 +104,10 @@ fn register_routing_filters(registry: &mut FilterRegistry) {
     );
     register_routing_security_filter(registry, "provider_route", ProviderRouteFilter::from_config);
     register_routing_security_filter(registry, "credential_inject", CredentialInjectFilter::from_config);
+    praxis_filter::register_filters!(
+        @register registry,
+        http "otel_context" => OtelContextFilter::from_config
+    );
 }
 
 /// Register a routing HTTP filter as security-critical.
@@ -340,6 +345,7 @@ mod tests {
             "intelligent_route",
             "provider_route",
             "credential_inject",
+            "otel_context",
             "anthropic_validate",
             "anthropic_web_search",
             "request_id",

@@ -627,6 +627,10 @@ impl HttpFilter for IntelligentRouteFilter {
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        #[cfg(feature = "otel")]
+        let _server_span =
+            crate::otel::enter_server_span(&ctx.request.method, ctx.request.uri.path(), &ctx.request.headers);
+
         // Client-supplied routing protocol context is never allowed to survive an
         // edge routing decision.
         ctx.request_headers_to_remove
@@ -681,6 +685,8 @@ fn apply_route(
 ) -> Result<(), FilterError> {
     ctx.cluster = Some(Arc::clone(&candidate.cluster));
     record_route_decision(ctx, local_site, candidate);
+    #[cfg(feature = "otel")]
+    crate::otel::record_routing_selection(candidate, local_site, semantic_revision.map(AsRef::as_ref));
     write_provider_context(ctx, candidate, provider_hop_clusters, semantic_revision)
 }
 
@@ -1008,6 +1014,10 @@ fn write_provider_context(
             .push((HeaderName::from_static(OVERLAY_REVISION_HEADER), rev_value));
     }
     ctx.set_metadata(ROUTE_PROVIDER_HOP_REQUEST_ID, hop_request_id);
+
+    #[cfg(feature = "otel")]
+    crate::otel::inject_client_traceparent(candidate, &mut ctx.request_headers_to_set);
+
     Ok(())
 }
 

@@ -11,6 +11,9 @@
 pub mod agentic;
 pub mod guardrails;
 pub mod inference;
+#[cfg(feature = "otel")]
+pub mod otel;
+pub mod otel_context;
 pub mod prompt_enrich;
 mod register;
 pub mod routing;
@@ -20,6 +23,7 @@ mod token_usage;
 pub use agentic::{a2a::A2aFilter, mcp::McpFilter};
 pub use guardrails::AiGuardrailsFilter;
 pub use inference::ModelToHeaderFilter;
+pub use otel_context::OtelContextFilter;
 pub use prompt_enrich::PromptEnrichFilter;
 pub use register::{build_ai_registry, register_ai_filters};
 pub use routing::{CredentialInjectFilter, IntelligentRouteFilter, ProviderRouteFilter};

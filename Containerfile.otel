@@ -1,0 +1,88 @@
+# syntax=docker/dockerfile:1
+
+# OTel-enabled Praxis AI image for GLB tracing demo.
+# Identical to the production Containerfile except --features otel is enabled.
+
+# ------------------------------------------------------------------------------
+# Stage 1: Build
+# ------------------------------------------------------------------------------
+
+FROM rust:1.97-alpine AS builder
+
+ENV OPENSSL_STATIC=1
+
+RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconf cmake make g++
+
+WORKDIR /src
+
+# ------------------------------------------------------------------------------
+# Cache Build
+# ------------------------------------------------------------------------------
+
+COPY Cargo.toml Cargo.lock ./
+COPY apis/Cargo.toml ./apis/Cargo.toml
+COPY filters/Cargo.toml ./filters/Cargo.toml
+COPY server/Cargo.toml ./server/Cargo.toml
+
+COPY server/build.rs ./server/build.rs
+
+RUN sed -i '/xtask/d; /tests\//d' Cargo.toml
+
+RUN mkdir -p apis/src filters/src server/src \
+    && echo '//! stub' > apis/src/lib.rs \
+    && echo '//! stub' > filters/src/lib.rs \
+    && echo '//! stub' > server/src/lib.rs \
+    && printf '//! stub\nfn main() {}\n' > server/src/main.rs
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --release -p praxis-ai-proxy --features otel
+
+# ------------------------------------------------------------------------------
+# Real source
+# ------------------------------------------------------------------------------
+
+COPY apis/src ./apis/src
+COPY filters/src ./filters/src
+COPY server/src ./server/src
+
+RUN find apis/src filters/src server/src \
+    -name '*.rs' -exec touch {} +
+
+# ------------------------------------------------------------------------------
+# Build
+# ------------------------------------------------------------------------------
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --release -p praxis-ai-proxy --features otel \
+    && cp target/release/praxis-ai /usr/local/bin/praxis-ai
+
+# ------------------------------------------------------------------------------
+# Stage 2: Runtime
+# ------------------------------------------------------------------------------
+
+FROM alpine:3.24
+
+LABEL org.opencontainers.image.source="https://github.com/praxis-proxy/ai" \
+    org.opencontainers.image.description="Praxis AI proxy server (OTel-enabled)" \
+    org.opencontainers.image.licenses="MIT"
+
+RUN apk add --no-cache ca-certificates \
+    && addgroup -S praxis \
+    && adduser -S -G praxis -h /nonexistent -s /sbin/nologin praxis \
+    && mkdir -p /etc/praxis
+
+COPY --from=builder --chown=root:root --chmod=0555 \
+    /usr/local/bin/praxis-ai /usr/local/bin/praxis-ai
+
+USER praxis:praxis
+
+WORKDIR /etc/praxis
+
+EXPOSE 8080 9901
+
+HEALTHCHECK --interval=5s --timeout=3s --start-period=2s \
+    CMD wget -qO- http://127.0.0.1:9901/healthy || exit 1
+
+ENTRYPOINT ["praxis-ai"]

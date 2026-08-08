@@ -83,6 +83,7 @@ praxis-ai-apis = { version = "0.2.0", path = "apis" }
 # Pingora (temporary fork)
 pingora-core = { version = "0.8.2", package = "quixotic-plecostomus-core", features = ["rustls"] }
 pingora-http = { version = "0.8.2", package = "quixotic-plecostomus-http" }
+
 pingora-proxy = { version = "0.8.2", package = "quixotic-plecostomus-proxy", features = ["rustls"] }
 arc-swap = "1.9.2"
 metrics = "0.24.6"
