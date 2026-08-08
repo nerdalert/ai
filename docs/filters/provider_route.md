@@ -22,10 +22,10 @@ These names are AI-owned rather than Praxis-reserved because Praxis intentionall
 | `routes[].cluster` | string | yes | Provider-local backend cluster. |
 | `routes[].credential` | CandidateCredential | no | Optional provider-local credential reference for the final API hop. |
 | `routes[].credential.strategy` | string | yes | Injection strategy. |
-| `routes[].credential.secret_ref` | CredentialRef | yes | Secret locator, never secret bytes. |
-| `routes[].credential.secret_ref.key` | string | yes | Secret data key. |
-| `routes[].credential.secret_ref.name` | string | yes | Secret name. |
-| `routes[].credential.secret_ref.namespace` | string | yes | Secret namespace. |
+| `routes[].credential.secretRef` | CredentialRef | yes | Secret locator, never secret bytes. |
+| `routes[].credential.secretRef.key` | string | yes | Secret data key. |
+| `routes[].credential.secretRef.name` | string | yes | Secret name. |
+| `routes[].credential.secretRef.namespace` | string | yes | Secret namespace. |
 | `routes[].model` | string | yes | Exact model accepted for this candidate. |
 | `routes[].paths` | string[] | yes | Exact inference paths accepted for this candidate. |
 | `emit_demo_attribution` | bool | no | Add a provider attribution response header for demo evidence. |

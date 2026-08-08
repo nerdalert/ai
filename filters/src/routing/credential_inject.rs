@@ -381,7 +381,7 @@ fn resolve_token(entry: &CredentialEntryConfig) -> Result<Zeroizing<String>, Fil
                 )
                 .into()
             })?;
-            let mut content = String::new();
+            let mut content = Zeroizing::new(String::new());
             file.take(MAX_TOKEN_READ_BYTES)
                 .read_to_string(&mut content)
                 .map_err(|e| -> FilterError {
@@ -394,9 +394,9 @@ fn resolve_token(entry: &CredentialEntryConfig) -> Result<Zeroizing<String>, Fil
             if content.len() > MAX_TOKEN_BYTES {
                 return Err(format!("credential_inject: file '{path}' exceeds {MAX_TOKEN_BYTES} bytes").into());
             }
-            let token = content.trim().to_owned();
+            let token = Zeroizing::new(content.trim().to_owned());
             validate_token(&token)?;
-            Ok(Zeroizing::new(token))
+            Ok(token)
         },
         (None, None, None) => Err(format!(
             "credential_inject: '{}/{}/{}' must have exactly one of 'value', 'env_var', or 'file'",
