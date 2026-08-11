@@ -127,7 +127,7 @@ struct CredentialEntryConfig {
 
     /// Inline token value.  Mutually exclusive with `env_var` and `file`.
     #[serde(default)]
-    value: Option<String>,
+    value: Option<Zeroizing<String>>,
 
     /// Environment variable holding the token.  Mutually exclusive with `value` and `file`.
     #[serde(default)]
@@ -360,7 +360,7 @@ fn resolve_token(entry: &CredentialEntryConfig) -> Result<Zeroizing<String>, Fil
     match (&entry.value, &entry.env_var, &entry.file) {
         (Some(val), None, None) => {
             validate_token(val)?;
-            Ok(Zeroizing::new(val.clone()))
+            Ok(val.clone())
         },
         (None, Some(var), None) => {
             validate_bounded("env_var", var, MAX_SOURCE_LEN)?;
