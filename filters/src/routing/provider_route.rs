@@ -385,85 +385,6 @@ mod tests {
         test_utils,
     };
 
-    fn provider_config(candidate_id: &str, model: &str, paths: &[&str], cluster: &str) -> serde_yaml::Value {
-        let paths_yaml: Vec<serde_yaml::Value> = paths.iter().map(|p| serde_yaml::Value::from(*p)).collect();
-        serde_yaml::to_value(serde_yaml::Mapping::from_iter([
-            (
-                serde_yaml::Value::from("provider_id"),
-                serde_yaml::Value::from("test-provider"),
-            ),
-            (
-                serde_yaml::Value::from("emit_demo_attribution"),
-                serde_yaml::Value::from(true),
-            ),
-            (
-                serde_yaml::Value::from("routes"),
-                serde_yaml::Value::Sequence(vec![
-                    serde_yaml::to_value(serde_yaml::Mapping::from_iter([
-                        (
-                            serde_yaml::Value::from("candidate_id"),
-                            serde_yaml::Value::from(candidate_id),
-                        ),
-                        (serde_yaml::Value::from("model"), serde_yaml::Value::from(model)),
-                        (
-                            serde_yaml::Value::from("paths"),
-                            serde_yaml::Value::Sequence(paths_yaml),
-                        ),
-                        (serde_yaml::Value::from("cluster"), serde_yaml::Value::from(cluster)),
-                    ]))
-                    .unwrap(),
-                ]),
-            ),
-        ]))
-        .unwrap()
-    }
-
-    fn make_filter(candidate_id: &str) -> Box<dyn HttpFilter> {
-        let config = provider_config(candidate_id, "sim-model-v1", &["/v1/chat/completions"], "mock-backend");
-        ProviderRouteFilter::from_config(&config).unwrap()
-    }
-
-    fn credential_provider_config() -> serde_yaml::Value {
-        serde_yaml::from_str(
-            "provider_id: test-provider\n\
-             routes:\n\
-             \x20 - candidate_id: abc123\n\
-             \x20   cluster: api-backend\n\
-             \x20   model: sim-model-v1\n\
-             \x20   paths: [/v1/chat/completions]\n\
-             \x20   credential:\n\
-             \x20     strategy: bearer_token\n\
-             \x20     secretRef:\n\
-             \x20       name: provider-token\n\
-             \x20       namespace: grid-system\n\
-             \x20       key: token\n",
-        )
-        .unwrap()
-    }
-
-    fn request_with_peer_context(
-        path: &str,
-        candidate_id: &str,
-        hop_request_id: &str,
-        model: &str,
-    ) -> praxis_filter::Request {
-        let mut req = test_utils::make_request(Method::POST, path);
-        req.headers.insert(
-            HeaderName::from_static(SELECTED_CANDIDATE_HEADER),
-            HeaderValue::from_str(candidate_id).unwrap(),
-        );
-        req.headers.insert(
-            HeaderName::from_static(PROVIDER_HOP_REQUEST_ID_HEADER),
-            HeaderValue::from_str(hop_request_id).unwrap(),
-        );
-        req.headers.insert(
-            HeaderName::from_static(OVERLAY_REVISION_HEADER),
-            HeaderValue::from_static("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-        );
-        req.headers.insert("X-Model", HeaderValue::from_str(model).unwrap());
-        req
-    }
-
     // ---- Header stripping ----
 
     #[tokio::test]
@@ -818,6 +739,29 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn omits_demo_attribution_response_header_by_default() {
+        let config = provider_config_with_demo_attribution(
+            "abc123",
+            "sim-model-v1",
+            &["/v1/chat/completions"],
+            "mock-backend",
+            None,
+        );
+        let f = ProviderRouteFilter::from_config(&config).unwrap();
+        let req = request_with_peer_context("/v1/chat/completions", "abc123", "req-1", "sim-model-v1");
+        let mut ctx = test_utils::make_filter_context(&req);
+        let _action = f.on_request(&mut ctx).await.unwrap();
+        let mut resp = test_utils::make_response();
+        ctx.response_header = Some(&mut resp);
+
+        let action = f.on_response(&mut ctx).await.unwrap();
+
+        assert!(matches!(action, FilterAction::Continue));
+        assert!(!ctx.response_headers_modified);
+        assert!(resp.headers.get(PROVIDER_ATTRIBUTION_RESPONSE_HEADER).is_none());
+    }
+
     // ---- Credential metadata ----
 
     #[tokio::test]
@@ -880,15 +824,6 @@ mod tests {
             ctx.request_headers_to_remove.contains(&AUTHORIZATION),
             "customer Authorization must be removed"
         );
-    }
-
-    /// Read the final queued value for an overwritten request header.
-    fn pending_header<'a>(ctx: &'a HttpFilterContext<'_>, name: &'static str) -> Option<&'a str> {
-        ctx.request_headers_to_set
-            .iter()
-            .rev()
-            .find(|(header, _)| header == name)
-            .and_then(|(_, value)| value.to_str().ok())
     }
 
     // ---- Config validation ----
@@ -960,5 +895,109 @@ mod tests {
     fn selects_cluster_returns_true() {
         let f = make_filter("abc123");
         assert!(f.selects_cluster(), "provider route must declare cluster selection");
+    }
+
+    // -------------------------------------------------------------------------
+    // Test Utilities
+    // -------------------------------------------------------------------------
+
+    fn provider_config(candidate_id: &str, model: &str, paths: &[&str], cluster: &str) -> serde_yaml::Value {
+        provider_config_with_demo_attribution(candidate_id, model, paths, cluster, Some(true))
+    }
+
+    fn provider_config_with_demo_attribution(
+        candidate_id: &str,
+        model: &str,
+        paths: &[&str],
+        cluster: &str,
+        emit_demo_attribution: Option<bool>,
+    ) -> serde_yaml::Value {
+        let paths_yaml: Vec<serde_yaml::Value> = paths.iter().map(|p| serde_yaml::Value::from(*p)).collect();
+        let mut config = serde_yaml::Mapping::from_iter([
+            (
+                serde_yaml::Value::from("provider_id"),
+                serde_yaml::Value::from("test-provider"),
+            ),
+            (
+                serde_yaml::Value::from("routes"),
+                serde_yaml::Value::Sequence(vec![
+                    serde_yaml::to_value(serde_yaml::Mapping::from_iter([
+                        (
+                            serde_yaml::Value::from("candidate_id"),
+                            serde_yaml::Value::from(candidate_id),
+                        ),
+                        (serde_yaml::Value::from("model"), serde_yaml::Value::from(model)),
+                        (
+                            serde_yaml::Value::from("paths"),
+                            serde_yaml::Value::Sequence(paths_yaml),
+                        ),
+                        (serde_yaml::Value::from("cluster"), serde_yaml::Value::from(cluster)),
+                    ]))
+                    .unwrap(),
+                ]),
+            ),
+        ]);
+        if let Some(enabled) = emit_demo_attribution {
+            config.insert(
+                serde_yaml::Value::from("emit_demo_attribution"),
+                serde_yaml::Value::from(enabled),
+            );
+        }
+        serde_yaml::to_value(config).unwrap()
+    }
+
+    fn make_filter(candidate_id: &str) -> Box<dyn HttpFilter> {
+        let config = provider_config(candidate_id, "sim-model-v1", &["/v1/chat/completions"], "mock-backend");
+        ProviderRouteFilter::from_config(&config).unwrap()
+    }
+
+    fn credential_provider_config() -> serde_yaml::Value {
+        serde_yaml::from_str(
+            "provider_id: test-provider\n\
+             routes:\n\
+             \x20 - candidate_id: abc123\n\
+             \x20   cluster: api-backend\n\
+             \x20   model: sim-model-v1\n\
+             \x20   paths: [/v1/chat/completions]\n\
+             \x20   credential:\n\
+             \x20     strategy: bearer_token\n\
+             \x20     secretRef:\n\
+             \x20       name: provider-token\n\
+             \x20       namespace: grid-system\n\
+             \x20       key: token\n",
+        )
+        .unwrap()
+    }
+
+    fn request_with_peer_context(
+        path: &str,
+        candidate_id: &str,
+        hop_request_id: &str,
+        model: &str,
+    ) -> praxis_filter::Request {
+        let mut req = test_utils::make_request(Method::POST, path);
+        req.headers.insert(
+            HeaderName::from_static(SELECTED_CANDIDATE_HEADER),
+            HeaderValue::from_str(candidate_id).unwrap(),
+        );
+        req.headers.insert(
+            HeaderName::from_static(PROVIDER_HOP_REQUEST_ID_HEADER),
+            HeaderValue::from_str(hop_request_id).unwrap(),
+        );
+        req.headers.insert(
+            HeaderName::from_static(OVERLAY_REVISION_HEADER),
+            HeaderValue::from_static("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        );
+        req.headers.insert("X-Model", HeaderValue::from_str(model).unwrap());
+        req
+    }
+
+    /// Read the final queued value for an overwritten request header.
+    fn pending_header<'a>(ctx: &'a HttpFilterContext<'_>, name: &'static str) -> Option<&'a str> {
+        ctx.request_headers_to_set
+            .iter()
+            .rev()
+            .find(|(header, _)| header == name)
+            .and_then(|(_, value)| value.to_str().ok())
     }
 }
