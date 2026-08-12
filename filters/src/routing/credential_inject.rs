@@ -784,7 +784,9 @@ mod tests {
         );
     }
 
-    // ---- Test utilities ----
+    // -------------------------------------------------------------------------
+    // Test Utilities
+    // -------------------------------------------------------------------------
 
     fn parse(yaml: &str) -> Result<Box<dyn HttpFilter>, FilterError> {
         let val: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
