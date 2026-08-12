@@ -1409,6 +1409,7 @@ fn render_type_path(tp: &syn::TypePath, enums: &BTreeMap<String, EnumInfo>) -> S
         "Vec" => render_vec_type(last, enums),
         "Option" => render_inner_or(last, enums, "any"),
         "Arc" => render_arc_type(last, enums),
+        "Zeroizing" => render_inner_or(last, enums, "any"),
         "BTreeMap" | "HashMap" => render_map_type(last, enums),
         "String" => "string".to_owned(),
         "SecretString" => "string (secret)".to_owned(),
@@ -2594,6 +2595,12 @@ mod tests {
             let ty: syn::Type = syn::parse_str(rust_ty).unwrap();
             assert_eq!(render_type(&ty, &enums), expected, "{rust_ty}");
         }
+    }
+
+    #[test]
+    fn zeroizing_wrapper_renders_its_yaml_value_type() {
+        let ty: syn::Type = syn::parse_str("Option<Zeroizing<String>>").unwrap();
+        assert_eq!(render_type(&ty, &BTreeMap::new()), "string");
     }
 
     /// Build a sample [`FilterEntry`] for rendering tests.
