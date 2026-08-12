@@ -1409,7 +1409,6 @@ fn render_type_path(tp: &syn::TypePath, enums: &BTreeMap<String, EnumInfo>) -> S
         "Vec" => render_vec_type(last, enums),
         "Option" | "Zeroizing" => render_inner_or(last, enums, "any"),
         "Arc" => render_arc_type(last, enums),
-        "Zeroizing" => render_inner_or(last, enums, "any"),
         "BTreeMap" | "HashMap" => render_map_type(last, enums),
         "String" => "string".to_owned(),
         "SecretString" => "string (secret)".to_owned(),
