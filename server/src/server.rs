@@ -6,8 +6,14 @@
 use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
+use async_trait::async_trait;
+use pingora_core::{
+    server::ShutdownWatch,
+    services::background::{BackgroundService, background_service},
+};
 use praxis_core::{
     PingoraServerRuntime,
     config::{Config, ProtocolKind},
@@ -19,6 +25,33 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::pipelines::resolve_pipelines;
+
+/// Prometheus recorder maintenance interval.
+///
+/// `PrometheusBuilder::install_recorder` does not spawn the exporter upkeep
+/// task. Keep upkeep independent of `/metrics` scrape traffic so histogram
+/// sample buffers are drained even when the admin endpoint is not scraped.
+/// This does not expire stale metric series; that requires recorder
+/// recency/idle-timeout configuration in Praxis.
+const PROMETHEUS_UPKEEP_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Pingora-managed Prometheus recorder maintenance.
+struct PrometheusUpkeepService {
+    /// Handle for the recorder installed by the Praxis admin service.
+    handle: metrics_exporter_prometheus::PrometheusHandle,
+}
+
+#[async_trait]
+impl BackgroundService for PrometheusUpkeepService {
+    async fn start(&self, mut shutdown: ShutdownWatch) {
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => break,
+                () = tokio::time::sleep(PROMETHEUS_UPKEEP_INTERVAL) => self.handle.run_upkeep(),
+            }
+        }
+    }
+}
 
 // -----------------------------------------------------------------------------
 // Config Path Resolution
@@ -232,6 +265,12 @@ fn register_admin_endpoints(
     kv_stores: &praxis_core::kv::KvStoreRegistry,
 ) {
     if let Some(admin_addr) = &config.admin.address {
+        let upkeep = PrometheusUpkeepService {
+            handle: praxis_protocol::http::pingora::metrics::install_prometheus_recorder().clone(),
+        };
+        server
+            .server_mut()
+            .add_service(background_service("Prometheus upkeep", upkeep));
         praxis_protocol::http::pingora::health::add_admin_endpoints_to_pingora_server(
             server.server_mut(),
             admin_addr,
