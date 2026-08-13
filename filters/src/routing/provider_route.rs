@@ -385,7 +385,9 @@ mod tests {
         test_utils,
     };
 
-    // ---- Header stripping ----
+    // -------------------------------------------------------------------------
+    // Header Stripping
+    // -------------------------------------------------------------------------
 
     #[tokio::test]
     async fn strips_routing_protocol_headers() {
@@ -559,7 +561,9 @@ mod tests {
         assert!(ctx.request_headers_to_set.is_empty());
     }
 
-    // ---- Exact candidate matching ----
+    // -------------------------------------------------------------------------
+    // Exact Candidate Matching
+    // -------------------------------------------------------------------------
 
     #[tokio::test]
     async fn known_candidate_selects_cluster() {
@@ -607,7 +611,9 @@ mod tests {
         );
     }
 
-    // ---- Missing required headers ----
+    // -------------------------------------------------------------------------
+    // Missing Required Headers
+    // -------------------------------------------------------------------------
 
     #[tokio::test]
     async fn missing_candidate_header_denied_403() {
@@ -663,7 +669,9 @@ mod tests {
         );
     }
 
-    // ---- Oversized/empty values fail closed ----
+    // -------------------------------------------------------------------------
+    // Oversized Or Empty Values Fail Closed
+    // -------------------------------------------------------------------------
 
     #[tokio::test]
     async fn empty_candidate_id_denied() {
@@ -690,7 +698,9 @@ mod tests {
         );
     }
 
-    // ---- Metadata output ----
+    // -------------------------------------------------------------------------
+    // Metadata Output
+    // -------------------------------------------------------------------------
 
     #[tokio::test]
     async fn sets_provider_route_metadata() {
@@ -705,7 +715,9 @@ mod tests {
         assert!(ctx.get_metadata(PROVIDER_ROUTE_REQUEST_ID).is_some());
     }
 
-    // ---- Provider attribution ----
+    // -------------------------------------------------------------------------
+    // Provider Attribution
+    // -------------------------------------------------------------------------
 
     #[tokio::test]
     async fn sets_provider_attribution_request_header() {
@@ -762,7 +774,9 @@ mod tests {
         assert!(resp.headers.get(PROVIDER_ATTRIBUTION_RESPONSE_HEADER).is_none());
     }
 
-    // ---- Credential metadata ----
+    // -------------------------------------------------------------------------
+    // Credential Metadata
+    // -------------------------------------------------------------------------
 
     #[tokio::test]
     async fn no_credential_clears_metadata() {
@@ -826,13 +840,33 @@ mod tests {
         );
     }
 
-    // ---- Config validation ----
+    // -------------------------------------------------------------------------
+    // Config Validation
+    // -------------------------------------------------------------------------
 
     #[test]
     fn empty_routes_rejected() {
         let yaml = "provider_id: p\nroutes: []\n";
         let val: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
         assert!(ProviderRouteFilter::from_config(&val).is_err());
+    }
+
+    #[test]
+    fn too_many_routes_rejected() {
+        let routes = (0..=MAX_PROVIDER_ROUTES)
+            .map(|index| {
+                format!(
+                    "  - candidate_id: candidate-{index}\n    model: model-{index}\n    paths: [/v1/chat/completions]\n    cluster: cluster-{index}\n"
+                )
+            })
+            .collect::<String>();
+        let yaml = format!("provider_id: p\nroutes:\n{routes}");
+        let val: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+
+        assert!(
+            ProviderRouteFilter::from_config(&val).is_err(),
+            "route count must be bounded"
+        );
     }
 
     #[test]
