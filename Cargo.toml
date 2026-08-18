@@ -27,6 +27,7 @@ axum = { version = "0.8.9", default-features = false, features = ["http1", "toki
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 clap = { version = "4.6.6", features = ["derive"] }
 dashmap = "6.2.1"
+redis = { version = "1.5.0", default-features = false, features = ["tokio-comp"] }
 futures = "0.3.33"
 h2 = "0.4.15"
 http = "1.5.0"
@@ -91,6 +92,12 @@ metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 metrics-util = { version = "0.20.4", default-features = false, features = ["debugging"] }
 cargo_metadata = "0.23.1"
+
+[patch.crates-io]
+praxis-proxy-core = { git = "https://github.com/nerdalert/praxis.git", rev = "76c5fe2fd6780d1f4d9316cdb0d218ebfba52b50" }
+praxis-proxy-filter = { git = "https://github.com/nerdalert/praxis.git", rev = "76c5fe2fd6780d1f4d9316cdb0d218ebfba52b50" }
+praxis-proxy-protocol = { git = "https://github.com/nerdalert/praxis.git", rev = "76c5fe2fd6780d1f4d9316cdb0d218ebfba52b50" }
+praxis-proxy-tls = { git = "https://github.com/nerdalert/praxis.git", rev = "76c5fe2fd6780d1f4d9316cdb0d218ebfba52b50" }
 
 [profile.release]
 codegen-units = 1

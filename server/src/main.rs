@@ -70,7 +70,28 @@ fn main() {
 
     let config_path = praxis_ai::resolve_config_path(explicit.as_deref());
     let config = praxis_ai::load_config(explicit.as_deref()).unwrap_or_else(|e| praxis_ai::fatal(&e));
-    praxis_ai::init_tracing(&config).unwrap_or_else(|e| praxis_ai::fatal(&e));
+
+    // The tonic OTLP exporter captures a Tokio handle while it is built and
+    // uses that runtime for later exports. Pingora creates its runtimes only
+    // when the server starts, so keep a dedicated telemetry runtime alive for
+    // the lifetime of the process and enter it only during tracing setup.
+    #[cfg(feature = "opentelemetry")]
+    let telemetry_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_name("praxis-otel")
+        .enable_all()
+        .build()
+        .unwrap_or_else(|e| praxis_ai::fatal(&format!("failed to create OpenTelemetry runtime: {e}")));
+
+    #[cfg(feature = "opentelemetry")]
+    let _tracing_guard = {
+        let _entered = telemetry_runtime.enter();
+        praxis_ai::init_tracing(&config).unwrap_or_else(|e| praxis_ai::fatal(&e))
+    };
+
+    #[cfg(not(feature = "opentelemetry"))]
+    let _tracing_guard = praxis_ai::init_tracing(&config).unwrap_or_else(|e| praxis_ai::fatal(&e));
+
     info!("starting server");
     praxis_ai::run_server(config, config_path)
 }

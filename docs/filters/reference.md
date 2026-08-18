@@ -86,6 +86,12 @@ see the [Praxis core filter reference][core-ref].
 |--------|-------------|
 | [`time_to_first_token`](time_to_first_token.md) | Measures time-to-first-token for streaming AI responses. |
 
+### Token Rate Limit
+
+| Filter | Description |
+|--------|-------------|
+| [`token_rate_limit`](token_rate_limit.md) | Local fixed-estimate sliding-window admission filter. |
+
 ### Token Usage
 
 | Filter | Description |

@@ -51,7 +51,7 @@ RUN mkdir -p apis/src filters/src server/src \
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p praxis-ai-proxy
+    cargo build --release -p praxis-ai-proxy --features opentelemetry
 
 # ------------------------------------------------------------------------------
 # Cache Tricks
@@ -74,7 +74,7 @@ RUN find apis/src filters/src server/src \
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p praxis-ai-proxy \
+    cargo build --release -p praxis-ai-proxy --features opentelemetry \
     && cp target/release/praxis-ai /usr/local/bin/praxis-ai
 
 # ------------------------------------------------------------------------------
