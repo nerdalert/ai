@@ -34,7 +34,7 @@ metrics = { workspace = true }
 notify = { workspace = true }
 praxis-ai-apis = { workspace = true }
 praxis-core = { workspace = true }
-praxis-filter = { workspace = true }
+praxis-filter = { workspace = true, features = ["basic-auth-filter"]}
 rand = { workspace = true }
 reqwest.workspace = true
 serde = { workspace = true }
