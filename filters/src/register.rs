@@ -11,6 +11,7 @@ use crate::HttpCalloutFilter;
 use crate::{
     A2aFilter, AiGuardrailsFilter, CredentialInjectFilter, IntelligentRouteFilter, McpFilter, ModelToHeaderFilter,
     PromptEnrichFilter, ProviderRouteFilter, Sigv4SignFilter, TimeToFirstTokenFilter, TokenCountFilter,
+    TokenRateLimitFilter,
     TokenUsageHeadersFilter,
 };
 
@@ -98,6 +99,10 @@ fn register_general_ai_filters(registry: &mut FilterRegistry) {
     praxis_filter::register_filters!(
         @register registry,
         http "token_count" => TokenCountFilter::from_config
+    );
+    praxis_filter::register_filters!(
+        @register registry,
+        http "token_rate_limit" => TokenRateLimitFilter::from_config
     );
     praxis_filter::register_filters!(
         @register registry,
