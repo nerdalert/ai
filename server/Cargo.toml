@@ -31,7 +31,7 @@ azure-ad-filter = ["praxis-ai-filters/azure-ad-filter", "experimental"]
 gcp-adc-filter = ["praxis-ai-filters/gcp-adc-filter", "experimental"]
 # Marker feature activated transitively by any experimental feature.
 experimental = ["praxis-ai-filters/experimental"]
-opentelemetry = ["praxis-ai-filters/opentelemetry"]
+opentelemetry = ["praxis-ai-filters/opentelemetry", "praxis-core/otel"]
 llmd-ext-proc = ["dep:praxis-ai-llmd-ext-proc"]
 praxis-main = ["praxis-ai-filters/praxis-main", "praxis-ai-apis/praxis-main"]
 
