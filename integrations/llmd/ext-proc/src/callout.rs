@@ -118,26 +118,21 @@ async fn send_and_receive(
     max_timeout: Option<Duration>,
     target: &str,
 ) -> Result<ProcessingResponse, FilterError> {
-    let deadline = tokio::time::Instant::now() + timeout;
+    let deadline = tokio::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or(CalloutError::Timeout)?;
 
-    let open_result = tokio::time::timeout_at(deadline, async {
-        let mut client = ExternalProcessorClient::new(channel);
-        let request_stream = stream::once(async { request });
-        let rpc = client.process(request_stream).await.map_err(CalloutError::Grpc)?;
-        Ok::<_, CalloutError>(rpc.into_inner())
-    })
-    .await;
-
-    let mut streaming = match open_result {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
+    let mut streaming = match open_stream(channel, request, deadline).await {
+        Ok(s) => s,
+        Err(CalloutError::Grpc(e)) => {
             tracing::warn!(target = %target, error = %e, "ext_proc stream open failed");
-            return Err(e.into());
+            return Err(CalloutError::Grpc(e).into());
         },
-        Err(_elapsed) => {
+        Err(CalloutError::Timeout) => {
             tracing::warn!(target = %target, "ext_proc callout timed out during stream open");
             return Err(CalloutError::Timeout.into());
         },
+        Err(CalloutError::EmptyStream) => return Err(CalloutError::EmptyStream.into()),
     };
 
     let result = receive_with_override(&mut streaming, deadline, max_timeout, target).await;
@@ -149,6 +144,22 @@ async fn send_and_receive(
             Err(e.into())
         },
     }
+}
+
+/// Open the processor stream before the initial callout deadline.
+async fn open_stream(
+    channel: Channel,
+    request: ProcessingRequest,
+    deadline: tokio::time::Instant,
+) -> Result<tonic::Streaming<ProcessingResponse>, CalloutError> {
+    tokio::time::timeout_at(deadline, async {
+        let mut client = ExternalProcessorClient::new(channel);
+        let request_stream = stream::once(async { request });
+        let rpc = client.process(request_stream).await.map_err(CalloutError::Grpc)?;
+        Ok::<_, CalloutError>(rpc.into_inner())
+    })
+    .await
+    .map_err(|_elapsed| CalloutError::Timeout)?
 }
 
 /// Read the first response, handling `override_message_timeout`.
@@ -183,7 +194,9 @@ async fn receive_with_override(
         "ext_proc: processor requested timeout override"
     );
 
-    let new_deadline = tokio::time::Instant::now() + override_dur;
+    let new_deadline = tokio::time::Instant::now()
+        .checked_add(override_dur)
+        .ok_or(CalloutError::Timeout)?;
     tokio::time::timeout_at(new_deadline, next_message(streaming))
         .await
         .map_err(|_elapsed| CalloutError::Timeout)?
@@ -204,16 +217,10 @@ async fn next_message(
 ///
 /// Returns `None` if the field is absent, the duration is zero, or
 /// `max_timeout` is not configured (overrides require an upper bound).
-fn parse_timeout_override(resp: &ProcessingResponse, max_timeout: Option<Duration>) -> Option<Duration> {
+pub(crate) fn parse_timeout_override(resp: &ProcessingResponse, max_timeout: Option<Duration>) -> Option<Duration> {
     let max = max_timeout?;
     let proto_dur = resp.override_message_timeout.as_ref()?;
-    let secs = u64::try_from(proto_dur.seconds).unwrap_or(0);
-    let nanos = u32::try_from(proto_dur.nanos).unwrap_or(0);
-    let dur = Duration::new(secs, nanos);
-
-    if dur.is_zero() {
-        return None;
-    }
+    let dur = parse_override_duration(proto_dur)?;
 
     let clamped = dur.min(max);
     if clamped < dur {
@@ -226,6 +233,19 @@ fn parse_timeout_override(resp: &ProcessingResponse, max_timeout: Option<Duratio
     }
 
     Some(clamped)
+}
+
+/// Parse an Envoy protobuf duration using the protobuf range and sign rules.
+fn parse_override_duration(value: &prost_types::Duration) -> Option<Duration> {
+    if value.seconds < 0 || value.seconds > 315_576_000_000 {
+        return None;
+    }
+    if value.nanos < 0 || value.nanos >= 1_000_000_000 {
+        return None;
+    }
+    #[expect(clippy::cast_sign_loss, reason = "negative values rejected above")]
+    let duration = Duration::new(value.seconds as u64, value.nanos as u32);
+    (!duration.is_zero()).then_some(duration)
 }
 
 /// Route a [`ProcessingResponse`] variant to the correct mutation handler.

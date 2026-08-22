@@ -899,6 +899,25 @@ fn request_to_proto_headers_includes_request_headers() {
     assert_eq!(rid.value, "abc-123", "x-request-id should match");
 }
 
+#[test]
+fn request_to_proto_headers_preserves_non_utf8_header_bytes() {
+    let mut req = make_request(Method::GET, "/");
+    req.headers
+        .insert("x-binary", http::HeaderValue::from_bytes(b"\xff\xfe").unwrap());
+    let ctx = make_ctx(&req);
+
+    let proto = mutations::request_to_proto_headers(&ctx);
+    let header = proto
+        .headers
+        .unwrap()
+        .headers
+        .into_iter()
+        .find(|header| header.key == "x-binary")
+        .expect("binary header should be forwarded");
+    assert!(header.value.is_empty(), "invalid UTF-8 should not be lossy text");
+    assert_eq!(header.raw_value, b"\xff\xfe");
+}
+
 // -----------------------------------------------------------------------------
 // Proto Conversion: response_to_proto_headers
 // -----------------------------------------------------------------------------
@@ -937,6 +956,44 @@ fn response_to_proto_headers_includes_response_headers() {
         .find(|h| h.key == "x-powered-by")
         .expect("should include x-powered-by");
     assert_eq!(hdr.value, "praxis", "x-powered-by value should match");
+}
+
+#[test]
+fn response_to_proto_headers_preserves_non_utf8_header_bytes() {
+    let req = make_request(Method::GET, "/");
+    let mut resp = make_response();
+    resp.headers
+        .insert("x-binary", http::HeaderValue::from_bytes(b"\xfe\xff").unwrap());
+    let mut ctx = make_ctx(&req);
+    ctx.response_header = Some(&mut resp);
+
+    let proto = mutations::response_to_proto_headers(&ctx);
+    let header = proto
+        .headers
+        .unwrap()
+        .headers
+        .into_iter()
+        .find(|header| header.key == "x-binary")
+        .expect("binary header should be forwarded");
+    assert!(header.value.is_empty(), "invalid UTF-8 should not be lossy text");
+    assert_eq!(header.raw_value, b"\xfe\xff");
+}
+
+#[test]
+fn callout_timeout_override_rejects_invalid_protobuf_durations() {
+    let response = |seconds: i64, nanos: i32| ProcessingResponse {
+        override_message_timeout: Some(prost_types::Duration { seconds, nanos }),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        callout::parse_timeout_override(&response(2, 0), Some(Duration::from_secs(5))),
+        Some(Duration::from_secs(2))
+    );
+    assert!(callout::parse_timeout_override(&response(-1, 0), Some(Duration::from_secs(5))).is_none());
+    assert!(callout::parse_timeout_override(&response(1, -1), Some(Duration::from_secs(5))).is_none());
+    assert!(callout::parse_timeout_override(&response(1, 1_000_000_000), Some(Duration::from_secs(5))).is_none());
+    assert!(callout::parse_timeout_override(&response(0, 0), Some(Duration::from_secs(5))).is_none());
 }
 
 #[test]

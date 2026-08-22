@@ -50,11 +50,11 @@ pub(crate) fn request_to_proto_headers(ctx: &HttpFilterContext<'_>) -> HttpHeade
     ];
 
     if let Some(authority) = ctx.request.headers.get(http::header::HOST) {
-        headers.push(proto_header(":authority", authority.to_str().unwrap_or_default()));
+        headers.push(proto_header_value(":authority", authority));
     }
 
     for (name, value) in &ctx.request.headers {
-        headers.push(proto_header(name.as_str(), value.to_str().unwrap_or_default()));
+        headers.push(proto_header_value(name.as_str(), value));
     }
 
     HttpHeaders {
@@ -75,7 +75,7 @@ pub(crate) fn response_to_proto_headers(ctx: &HttpFilterContext<'_>) -> HttpHead
         headers.push(proto_header(":status", &resp.status.as_u16().to_string()));
 
         for (name, value) in &resp.headers {
-            headers.push(proto_header(name.as_str(), value.to_str().unwrap_or_default()));
+            headers.push(proto_header_value(name.as_str(), value));
         }
     }
 
@@ -357,6 +357,18 @@ fn proto_header(key: &str, value: &str) -> HeaderValue {
         key: key.to_owned(),
         value: value.to_owned(),
         raw_value: Vec::new(),
+    }
+}
+
+/// Convert an HTTP header value while preserving bytes that are not valid UTF-8.
+fn proto_header_value(key: &str, value: &http::HeaderValue) -> HeaderValue {
+    match value.to_str() {
+        Ok(value) => proto_header(key, value),
+        Err(_) => HeaderValue {
+            key: key.to_owned(),
+            value: String::new(),
+            raw_value: value.as_bytes().to_vec(),
+        },
     }
 }
 

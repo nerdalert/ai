@@ -1078,7 +1078,9 @@ impl ExtProcFilter {
 /// mutations in this request.
 fn coalesced_body_limit(ctx: &HttpFilterContext<'_>) -> usize {
     match ctx.request_body_mode {
-        BodyMode::StreamBuffer { max_bytes } => max_bytes.unwrap_or(MAX_COALESCED_BODY_BYTES),
+        BodyMode::StreamBuffer { max_bytes } => {
+            max_bytes.map_or(MAX_COALESCED_BODY_BYTES, |limit| limit.min(MAX_COALESCED_BODY_BYTES))
+        },
         BodyMode::SizeLimit { max_bytes } => max_bytes.min(MAX_COALESCED_BODY_BYTES),
         _ => MAX_COALESCED_BODY_BYTES,
     }
