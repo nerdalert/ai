@@ -35,4 +35,3 @@ tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "process"] }
 tokio-tungstenite = { workspace = true }
 rustls-pemfile = { workspace = true }
-tonic = { workspace = true }
