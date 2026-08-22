@@ -8,7 +8,7 @@ readme = "../../README.md"
 publish = false
 
 [features]
-cpex-policy-engine = []
+cpex-policy-engine = ["praxis-filter/policy-engine"]
 # Experimental: gates the lakera-guard example test, which needs the
 # http_callout filter registered in the in-process proxy registry.
 http-callout-filter = ["praxis-ai-proxy/http-callout-filter"]
