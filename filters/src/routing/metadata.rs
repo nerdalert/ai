@@ -43,6 +43,8 @@ pub(crate) const ROUTE_KIND: &str = "intelligent_route.kind";
 pub(crate) const ROUTE_LOCAL_SITE: &str = "intelligent_route.local_site";
 /// Candidate name from the overlay.
 pub(crate) const ROUTE_NAME: &str = "intelligent_route.name";
+/// Provider-facing physical model selected with the route.
+pub(crate) const ROUTE_PROVIDER_MODEL: &str = "intelligent_route.provider_model";
 /// Selection rank within the candidate tier.
 pub(crate) const ROUTE_RANK: &str = "intelligent_route.rank";
 /// Producer-defined group used for this selection.

@@ -313,6 +313,10 @@ pub(crate) struct OverlayCandidate {
     /// Capability name (model name, tool name).
     pub(crate) name: String,
 
+    /// Provider-facing physical model selected with this candidate.
+    #[serde(default)]
+    pub(crate) provider_model: Option<String>,
+
     /// Producer-assigned rank within the overlay (lower is better).
     #[serde(default)]
     pub(crate) rank: Option<u32>,
@@ -795,6 +799,7 @@ fn overlay_to_candidates(
                 fresh: oc.fresh,
                 kind,
                 name: oc.name.clone(),
+                provider_model: oc.provider_model.clone(),
                 site: oc.site.clone(),
             })
         })

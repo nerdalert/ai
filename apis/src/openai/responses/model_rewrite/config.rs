@@ -19,6 +19,7 @@ use serde::Deserialize;
 ///
 /// ```yaml
 /// filter: openai_responses_model_rewrite
+/// source: static
 /// default_model: "llama-3.3-70b"
 /// model_aliases:
 ///   "codex-mini-latest": "llama-3.3-70b"
@@ -34,9 +35,27 @@ use serde::Deserialize;
 /// Quote wildcard alias keys in YAML, such as `"gpt-4.1-*"`, so `*` is
 /// parsed as a literal character rather than YAML alias syntax. The examples
 /// quote all alias keys for consistency.
+///
+/// For Grid-selected translation, use `source: selected_candidate` and omit
+/// `default_model` and `model_aliases`. The filter then reads the trusted
+/// `intelligent_route.name` and `intelligent_route.provider_model` metadata.
+/// For a different trusted selector, use `source: metadata` with explicit
+/// `logical_model_key` and `target_model_key` values.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ModelRewriteConfig {
+    /// Source of the physical model mapping.
+    #[serde(default)]
+    pub source: ModelRewriteSource,
+
+    /// Trusted metadata key containing the logical model for `metadata` mode.
+    #[serde(default)]
+    pub logical_model_key: Option<String>,
+
+    /// Trusted metadata key containing the provider model for `metadata` mode.
+    #[serde(default)]
+    pub target_model_key: Option<String>,
+
     /// Model name to inject when the request body has no `model`
     /// field or when the field is `null`.
     #[serde(default)]
@@ -59,6 +78,24 @@ pub(super) struct ModelRewriteConfig {
     /// Behavior when the body is not valid JSON.
     #[serde(default)]
     pub on_invalid: OnInvalidBehavior,
+}
+
+/// Determines whether model mappings come from static aliases or the
+/// trusted candidate selected by `intelligent_route`.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ModelRewriteSource {
+    /// Preserve the existing static alias/default behavior.
+    #[default]
+    Static,
+
+    /// Use `intelligent_route.name` and
+    /// `intelligent_route.provider_model` metadata.
+    SelectedCandidate,
+
+    /// Read the logical and target model from explicitly configured trusted
+    /// in-process metadata keys.
+    Metadata,
 }
 
 /// Default for `max_body_bytes`.
@@ -138,11 +175,31 @@ pub(super) enum OnInvalidBehavior {
 ///
 /// [`FilterError`]: praxis_filter::FilterError
 pub(super) fn validate_config(cfg: &ModelRewriteConfig) -> Result<(), FilterError> {
-    if cfg.default_model.is_none() && cfg.model_aliases.is_empty() {
+    if cfg.source == ModelRewriteSource::Static && cfg.default_model.is_none() && cfg.model_aliases.is_empty() {
         return Err(
             "openai_responses_model_rewrite: at least one of 'default_model' or 'model_aliases' must be configured"
                 .into(),
         );
+    }
+
+    if cfg.source == ModelRewriteSource::SelectedCandidate
+        && (cfg.default_model.is_some() || !cfg.model_aliases.is_empty())
+    {
+        return Err(
+            "openai_responses_model_rewrite: 'default_model' and 'model_aliases' cannot be combined with source: selected_candidate"
+                .into(),
+        );
+    }
+
+    if cfg.source == ModelRewriteSource::Static
+        && (cfg.logical_model_key.is_some() || cfg.target_model_key.is_some())
+    {
+        return Err("openai_responses_model_rewrite: metadata keys require a dynamic source".into());
+    }
+
+    if cfg.source == ModelRewriteSource::Metadata {
+        validate_metadata_key("logical_model_key", cfg.logical_model_key.as_deref())?;
+        validate_metadata_key("target_model_key", cfg.target_model_key.as_deref())?;
     }
 
     if let Some(dm) = &cfg.default_model
@@ -196,6 +253,16 @@ fn validate_header_name(field: &str, name: Option<&str>) -> Result<(), FilterErr
     Ok(())
 }
 
+fn validate_metadata_key(field: &str, key: Option<&str>) -> Result<(), FilterError> {
+    let Some(key) = key else {
+        return Err(format!("openai_responses_model_rewrite: '{field}' is required for source: metadata").into());
+    };
+    if key.is_empty() || key.len() > 64 || key.chars().any(|character| character.is_control()) {
+        return Err(format!("openai_responses_model_rewrite: '{field}' must be 1-64 non-control bytes").into());
+    }
+    Ok(())
+}
+
 // -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
@@ -227,6 +294,41 @@ default_model: "llama-3.3-70b"
         assert_eq!(cfg.max_body_bytes, DEFAULT_JSON_BODY_MAX_BYTES);
         assert_eq!(cfg.on_invalid, OnInvalidBehavior::Continue);
         assert!(cfg.model_aliases.is_empty());
+        assert_eq!(cfg.source, ModelRewriteSource::Static);
+    }
+
+    #[test]
+    fn selected_candidate_source_accepts_empty_static_mapping() {
+        let cfg: ModelRewriteConfig = serde_yaml::from_str("source: selected_candidate").unwrap();
+        assert_eq!(cfg.source, ModelRewriteSource::SelectedCandidate);
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn selected_candidate_source_rejects_static_mapping() {
+        let cfg: ModelRewriteConfig = serde_yaml::from_str(
+            "source: selected_candidate\ndefault_model: physical-model",
+        )
+        .unwrap();
+        let err = validate_config(&cfg).unwrap_err();
+        assert!(err.to_string().contains("cannot be combined"));
+    }
+
+    #[test]
+    fn metadata_source_requires_explicit_keys() {
+        let cfg: ModelRewriteConfig = serde_yaml::from_str("source: metadata").unwrap();
+        let err = validate_config(&cfg).unwrap_err();
+        assert!(err.to_string().contains("logical_model_key"));
+    }
+
+    #[test]
+    fn metadata_source_accepts_explicit_keys() {
+        let cfg: ModelRewriteConfig = serde_yaml::from_str(
+            "source: metadata\nlogical_model_key: semantic.logical\ntarget_model_key: semantic.physical",
+        )
+        .unwrap();
+        assert_eq!(cfg.source, ModelRewriteSource::Metadata);
+        assert!(validate_config(&cfg).is_ok());
     }
 
     #[test]
@@ -285,6 +387,9 @@ extra: true
     #[test]
     fn validate_no_default_model_no_aliases_rejected() {
         let cfg = ModelRewriteConfig {
+            source: ModelRewriteSource::Static,
+            logical_model_key: None,
+            target_model_key: None,
             default_model: None,
             headers: ModelRewriteHeaders::default(),
             max_body_bytes: DEFAULT_JSON_BODY_MAX_BYTES,
@@ -301,6 +406,9 @@ extra: true
     #[test]
     fn validate_empty_default_model_rejected() {
         let cfg = ModelRewriteConfig {
+            source: ModelRewriteSource::Static,
+            logical_model_key: None,
+            target_model_key: None,
             default_model: Some(String::new()),
             headers: ModelRewriteHeaders::default(),
             max_body_bytes: DEFAULT_JSON_BODY_MAX_BYTES,
@@ -317,6 +425,9 @@ extra: true
     #[test]
     fn validate_whitespace_only_default_model_rejected() {
         let cfg = ModelRewriteConfig {
+            source: ModelRewriteSource::Static,
+            logical_model_key: None,
+            target_model_key: None,
             default_model: Some("   ".into()),
             headers: ModelRewriteHeaders::default(),
             max_body_bytes: DEFAULT_JSON_BODY_MAX_BYTES,
@@ -333,6 +444,9 @@ extra: true
     #[test]
     fn validate_default_model_only_ok() {
         let cfg = ModelRewriteConfig {
+            source: ModelRewriteSource::Static,
+            logical_model_key: None,
+            target_model_key: None,
             default_model: Some("llama-3.3-70b".into()),
             headers: ModelRewriteHeaders::default(),
             max_body_bytes: DEFAULT_JSON_BODY_MAX_BYTES,
@@ -347,6 +461,9 @@ extra: true
         let mut aliases = HashMap::new();
         aliases.insert("gpt-4".into(), "llama-3.3-70b".into());
         let cfg = ModelRewriteConfig {
+            source: ModelRewriteSource::Static,
+            logical_model_key: None,
+            target_model_key: None,
             default_model: None,
             headers: ModelRewriteHeaders::default(),
             max_body_bytes: DEFAULT_JSON_BODY_MAX_BYTES,
@@ -361,6 +478,9 @@ extra: true
         let mut aliases = HashMap::new();
         aliases.insert("gpt-4".into(), "llama-3.3-70b".into());
         let cfg = ModelRewriteConfig {
+            source: ModelRewriteSource::Static,
+            logical_model_key: None,
+            target_model_key: None,
             default_model: Some("default-model".into()),
             headers: ModelRewriteHeaders::default(),
             max_body_bytes: DEFAULT_JSON_BODY_MAX_BYTES,
@@ -454,6 +574,9 @@ extra: true
     #[test]
     fn validate_zero_max_body_bytes_rejected() {
         let cfg = ModelRewriteConfig {
+            source: ModelRewriteSource::Static,
+            logical_model_key: None,
+            target_model_key: None,
             default_model: Some("test-model".into()),
             headers: ModelRewriteHeaders::default(),
             max_body_bytes: 0,
