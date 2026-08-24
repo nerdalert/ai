@@ -3,16 +3,21 @@
 
 # `openai_responses_model_rewrite`
 
-Rewrites the `model` field in Responses API request bodies.
+Rewrites the `model` field in OpenAI-compatible request bodies.
 
 ## Configuration Notes
 
 Quote wildcard alias keys in YAML, such as `"gpt-4.1-*"`, so `*` is parsed as a literal character rather than YAML alias syntax. The examples quote all alias keys for consistency.
 
+For Grid-selected translation, use `source: selected_candidate` and omit `default_model` and `model_aliases`. The filter then reads the trusted `intelligent_route.name` and `intelligent_route.provider_model` metadata. For a different trusted selector, use `source: metadata` with explicit `logical_model_key` and `target_model_key` values.
+
 ## Configuration
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
+| `source` | `static` \| `selected_candidate` \| `metadata` | no | Source of the physical model mapping. |
+| `logical_model_key` | string | no | Trusted metadata key containing the logical model for `metadata` mode. |
+| `target_model_key` | string | no | Trusted metadata key containing the provider model for `metadata` mode. |
 | `default_model` | string | no | Model name to inject when the request body has no `model` field or when the field is `null`. |
 | `headers` | ModelRewriteHeaders | no | Header names for promoted model values. |
 | `headers.effective_model` | string | no | Header name for the effective (post-rewrite) model value. |
@@ -27,6 +32,7 @@ Quote wildcard alias keys in YAML, such as `"gpt-4.1-*"`, so `*` is parsed as a 
 
 ```yaml
 filter: openai_responses_model_rewrite
+source: static
 default_model: "llama-3.3-70b"
 model_aliases:
   "codex-mini-latest": "llama-3.3-70b"

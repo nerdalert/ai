@@ -40,7 +40,7 @@ use super::{
     descriptor::{self, AdmissionState, CandidateConfig, CapabilityKind, RouteCandidate},
     metadata::{
         OVERLAY_REVISION_HEADER, PROVIDER_HOP_REQUEST_ID_HEADER, ROUTE_ADMISSION_STATE, ROUTE_CLUSTER, ROUTE_KIND,
-        ROUTE_LOCAL_SITE, ROUTE_NAME, ROUTE_PROVIDER_HOP_REQUEST_ID, ROUTE_RANK, ROUTE_SELECTION_GROUP,
+        ROUTE_LOCAL_SITE, ROUTE_NAME, ROUTE_PROVIDER_HOP_REQUEST_ID, ROUTE_PROVIDER_MODEL, ROUTE_RANK, ROUTE_SELECTION_GROUP,
         ROUTE_SELECTION_MODE, ROUTE_SELECTION_TIER, ROUTE_SITE, ROUTE_STABLE_ID, SELECTED_CANDIDATE_HEADER,
         set_credential_metadata,
     },
@@ -952,6 +952,9 @@ fn record_route_decision(ctx: &mut HttpFilterContext<'_>, local_site: &Arc<str>,
     ctx.set_metadata(ROUTE_KIND, candidate.kind.as_str());
     ctx.set_metadata(ROUTE_LOCAL_SITE, &**local_site);
     ctx.set_metadata(ROUTE_NAME, &*candidate.name);
+    if let Some(provider_model) = &candidate.provider_model {
+        ctx.set_metadata(ROUTE_PROVIDER_MODEL, &**provider_model);
+    }
     ctx.set_metadata(ROUTE_SITE, &*candidate.site);
     ctx.set_metadata(ROUTE_STABLE_ID, &*candidate.stable_id);
     if let Some(rank) = candidate.rank {
@@ -2692,6 +2695,7 @@ mod tests {
                     fresh: true,
                     kind: CapabilityKind::InferenceModel,
                     name: "llama".to_owned(),
+                    provider_model: None,
                     site: site1.to_owned(),
                 },
                 CandidateConfig {
@@ -2700,6 +2704,7 @@ mod tests {
                     fresh: true,
                     kind: CapabilityKind::InferenceModel,
                     name: "llama".to_owned(),
+                    provider_model: None,
                     site: site2.to_owned(),
                 },
             ])
@@ -2716,6 +2721,7 @@ mod tests {
                 fresh: true,
                 kind: CapabilityKind::InferenceModel,
                 name: "llama".to_owned(),
+                provider_model: None,
                 site: "site-a".to_owned(),
             }])
             .unwrap(),
@@ -2763,6 +2769,7 @@ mod tests {
                 fresh: true,
                 kind: CapabilityKind::InferenceModel,
                 name: Arc::from("llama"),
+                provider_model: None,
                 rank: None,
                 selection_group: None,
                 traffic_weight: None,

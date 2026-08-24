@@ -54,6 +54,7 @@ Supports two modes:
 | `candidates[].fresh` | bool | no | Whether this candidate is fresh (default: `true`). |
 | `candidates[].kind` | `inference_model` \| `mcp_tool` | yes | Capability kind. |
 | `candidates[].name` | string | yes | Capability name (model name, tool name, or agent name). |
+| `candidates[].provider_model` | string | no | Optional provider-facing physical model. When absent, `name` is also the physical model for backward compatibility. |
 | `candidates[].site` | string | yes | Site that owns this capability. |
 | `local_site` | string | no | Name of the local site (required in static mode, provided by overlay in overlay mode). |
 | `model_header` | string | no | Header name that carries the model name (default: `X-Model`). |

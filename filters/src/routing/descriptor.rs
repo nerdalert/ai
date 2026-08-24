@@ -158,6 +158,11 @@ pub(crate) struct CandidateConfig {
     /// Capability name (model name, tool name, or agent name).
     pub name: String,
 
+    /// Optional provider-facing physical model. When absent, `name` is also
+    /// the physical model for backward compatibility.
+    #[serde(default)]
+    pub provider_model: Option<String>,
+
     /// Site that owns this capability.
     pub site: String,
 }
@@ -207,6 +212,9 @@ pub(crate) struct RouteCandidate {
 
     /// Capability name.
     pub name: Arc<str>,
+
+    /// Provider-facing physical model selected with this candidate.
+    pub provider_model: Option<Arc<str>>,
 
     /// Producer-assigned rank within the overlay (lower is better).
     pub rank: Option<u32>,
@@ -290,6 +298,12 @@ pub(crate) fn validate_candidates_with_empty_policy(
 
     for (i, c) in raw.into_iter().enumerate() {
         validate_name(&format!("candidates[{i}].name"), &c.name)?;
+        if let Some(provider_model) = &c.provider_model {
+            validate_name(&format!("candidates[{i}].provider_model"), provider_model)?;
+            if c.kind != CapabilityKind::InferenceModel {
+                return Err(format!("routing: candidates[{i}].provider_model is only valid for inference_model").into());
+            }
+        }
         validate_name(&format!("candidates[{i}].site"), &c.site)?;
         validate_name(&format!("candidates[{i}].cluster"), &c.cluster)?;
         validate_credential(i, c.credential.as_ref())?;
@@ -313,6 +327,7 @@ pub(crate) fn validate_candidates_with_empty_policy(
             fresh: c.fresh,
             kind: c.kind,
             name: Arc::from(c.name.as_str()),
+            provider_model: c.provider_model.map(|model| Arc::from(model.as_str())),
             rank: None,
             selection_group: None,
             traffic_weight: None,
@@ -628,6 +643,7 @@ mod tests {
             fresh: true,
             kind,
             name: name.to_owned(),
+            provider_model: None,
             site: site.to_owned(),
         }
     }

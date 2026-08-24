@@ -1127,10 +1127,122 @@ async fn run_filter_raw(config_yaml: &str, body_str: &str) -> FilterAction {
     filter.on_request_body(&mut ctx, &mut body, true).await.unwrap()
 }
 
+/// Run selected-candidate mode with trusted routing metadata.
+async fn run_selected_filter(
+    path: &str,
+    body_str: &str,
+    logical_model: &str,
+    physical_model: &str,
+) -> (FilterAction, HttpFilterContext<'static>, Bytes) {
+    let filter = make_filter(
+        r#"
+source: selected_candidate
+headers:
+  effective_model: x-model
+  original_model: x-original-model
+"#,
+    );
+    let req: &'static praxis_filter::Request = Box::leak(Box::new(crate::test_utils::make_request(
+        http::Method::POST,
+        path,
+    )));
+    let mut ctx = crate::test_utils::make_filter_context(req);
+    ctx.set_metadata("intelligent_route.name", logical_model);
+    ctx.set_metadata("intelligent_route.provider_model", physical_model);
+    let mut body = Some(Bytes::from(body_str.to_owned()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    (action, ctx, body.unwrap())
+}
+
+/// Run generic metadata mode with keys owned by a non-Grid selector.
+async fn run_metadata_filter(
+    path: &str,
+    body_str: &str,
+    logical_model: &str,
+    physical_model: &str,
+) -> (FilterAction, Bytes) {
+    let filter = make_filter(
+        r#"
+source: metadata
+logical_model_key: semantic_router.logical_model
+target_model_key: semantic_router.provider_model
+"#,
+    );
+    let req: &'static praxis_filter::Request = Box::leak(Box::new(crate::test_utils::make_request(
+        http::Method::POST,
+        path,
+    )));
+    let mut ctx = crate::test_utils::make_filter_context(req);
+    ctx.set_metadata("semantic_router.logical_model", logical_model);
+    ctx.set_metadata("semantic_router.provider_model", physical_model);
+    let mut body = Some(Bytes::from(body_str.to_owned()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    (action, body.unwrap())
+}
+
 /// Collect extra request headers into a map for assertions.
 fn collect_headers<'a>(ctx: &'a HttpFilterContext<'_>) -> HashMap<&'a str, &'a str> {
     ctx.extra_request_headers
         .iter()
         .map(|(k, v)| (k.as_ref(), v.as_str()))
         .collect()
+}
+
+#[tokio::test]
+async fn selected_candidate_rewrites_responses_model() {
+    let (action, ctx, body) = run_selected_filter(
+        "/v1/responses",
+        r#"{"model":"chat-default","input":"hello"}"#,
+        "chat-default",
+        "gpt-4o-mini",
+    )
+    .await;
+
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["model"], "gpt-4o-mini");
+    let headers = collect_headers(&ctx);
+    assert_eq!(headers.get("x-model"), Some(&"gpt-4o-mini"));
+    assert_eq!(headers.get("x-original-model"), Some(&"chat-default"));
+}
+
+#[tokio::test]
+async fn selected_candidate_rewrites_chat_completions_model() {
+    let (action, _ctx, body) = run_selected_filter(
+        "/v1/chat/completions",
+        r#"{"model":"chat-default","messages":[]}"#,
+        "chat-default",
+        "qwen2.5-3b",
+    )
+    .await;
+
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["model"], "qwen2.5-3b");
+}
+
+#[tokio::test]
+async fn selected_candidate_rejects_client_physical_model_bypass() {
+    let (action, _ctx, body) = run_selected_filter(
+        "/v1/responses",
+        r#"{"model":"gpt-4o-mini","input":"hello"}"#,
+        "chat-default",
+        "gpt-4o-mini",
+    )
+    .await;
+
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 400));
+    assert_eq!(body, Bytes::from(r#"{"model":"gpt-4o-mini","input":"hello"}"#));
+}
+
+#[tokio::test]
+async fn metadata_source_rewrites_without_grid_metadata() {
+    let (action, body) = run_metadata_filter(
+        "/v1/chat/completions",
+        r#"{"model":"chat-default","messages":[]}"#,
+        "chat-default",
+        "qwen2.5-3b",
+    )
+    .await;
+
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["model"], "qwen2.5-3b");
 }

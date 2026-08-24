@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Praxis Contributors
 
-//! Model rewrite filter for `OpenAI` Responses API requests.
+//! Model rewrite filter for OpenAI-compatible inference requests.
 //!
-//! Rewrites the top-level `model` field in `POST /v1/responses`
-//! request bodies using a configured alias map. Alias sources may
+//! Rewrites the top-level `model` field in `POST /v1/responses` or
+//! `POST /v1/chat/completions` request bodies using a configured alias map.
+//! Alias sources may
 //! be exact model names or single-wildcard patterns such as
 //! `codex-*`; exact aliases win before wildcard aliases, then the
 //! wildcard with the most literal characters wins. Equal-specificity
@@ -16,10 +17,11 @@
 //! requests are re-serialized as JSON, so original whitespace and
 //! byte-level object key order are not preserved.
 //!
-//! Gates on the request path (`POST /v1/responses` exactly), not
-//! on classifier metadata. This ensures `on_invalid: reject` fires
-//! for malformed JSON on the create endpoint even when the
-//! classifier could not classify the body.
+//! Static alias mode retains the existing Responses-only path behavior.
+//! Dynamic modes additionally support `POST /v1/chat/completions` and read a
+//! trusted logical/physical model pair from in-process metadata. The
+//! `selected_candidate` mode is a Grid/intelligent-route preset; `metadata`
+//! mode accepts explicit metadata keys for other trusted selectors.
 
 mod config;
 
@@ -46,7 +48,7 @@ use praxis_filter::{
 };
 use tracing::{debug, trace, warn};
 
-use self::config::{ModelRewriteConfig, OnInvalidBehavior, validate_config};
+use self::config::{ModelRewriteConfig, ModelRewriteSource, OnInvalidBehavior, validate_config};
 use super::error::responses_error_rejection;
 use crate::{classifier::is_responses_create, json_body::replace_json_body, promotion::is_promotable_value};
 
@@ -54,12 +56,13 @@ use crate::{classifier::is_responses_create, json_body::replace_json_body, promo
 // ModelRewriteFilter
 // -----------------------------------------------------------------------------
 
-/// Rewrites the `model` field in Responses API request bodies.
+/// Rewrites the `model` field in OpenAI-compatible request bodies.
 ///
 /// # YAML
 ///
 /// ```yaml
 /// filter: openai_responses_model_rewrite
+/// source: static
 /// default_model: "llama-3.3-70b"
 /// model_aliases:
 ///   "codex-mini-latest": "llama-3.3-70b"
@@ -81,7 +84,40 @@ use crate::{classifier::is_responses_create, json_body::replace_json_body, promo
 ///   effective_model: x-praxis-ai-effective-model
 ///   original_model: x-praxis-ai-original-model
 /// ```
+///
+/// Selected-candidate mode is configured after `intelligent_route`:
+///
+/// ```yaml
+/// filter: openai_responses_model_rewrite
+/// source: selected_candidate
+/// headers:
+///   effective_model: X-Model
+///   original_model: X-Original-Model
+/// ```
+///
+/// The selected candidate's logical `name` must match the request body model.
+/// Its optional `provider_model` is then written into the body and effective
+/// model header. A client cannot select a physical model by bypassing the
+/// logical model contract.
+///
+/// A generic trusted selector can use explicit metadata keys instead:
+///
+/// ```yaml
+/// filter: openai_responses_model_rewrite
+/// source: metadata
+/// logical_model_key: semantic_router.logical_model
+/// target_model_key: semantic_router.provider_model
+/// ```
 pub struct ModelRewriteFilter {
+    /// Source of the physical model mapping.
+    source: ModelRewriteSource,
+
+    /// Trusted metadata key for the logical model in dynamic mode.
+    logical_model_key: Option<String>,
+
+    /// Trusted metadata key for the physical model in dynamic mode.
+    target_model_key: Option<String>,
+
     /// Model name to inject when absent or null.
     default_model: Option<String>,
 
@@ -110,7 +146,18 @@ impl ModelRewriteFilter {
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: ModelRewriteConfig = parse_filter_config("openai_responses_model_rewrite", config)?;
         validate_config(&cfg)?;
+        let (logical_model_key, target_model_key) = match cfg.source {
+            ModelRewriteSource::Static => (None, None),
+            ModelRewriteSource::SelectedCandidate => (
+                Some(cfg.logical_model_key.unwrap_or_else(|| "intelligent_route.name".to_owned())),
+                Some(cfg.target_model_key.unwrap_or_else(|| "intelligent_route.provider_model".to_owned())),
+            ),
+            ModelRewriteSource::Metadata => (cfg.logical_model_key.clone(), cfg.target_model_key.clone()),
+        };
         Ok(Box::new(Self {
+            source: cfg.source,
+            logical_model_key,
+            target_model_key,
             default_model: cfg.default_model,
             headers: cfg.headers,
             max_body_bytes: cfg.max_body_bytes,
@@ -142,7 +189,55 @@ impl ModelRewriteFilter {
             return Ok(invalid_body_action(self.on_invalid, streaming));
         };
 
-        let result = apply_rewrite(obj, &self.model_aliases, self.default_model.as_deref());
+        let result = match self.source {
+            ModelRewriteSource::Static => apply_rewrite(obj, &self.model_aliases, self.default_model.as_deref()),
+            ModelRewriteSource::SelectedCandidate => {
+                let Some(target_key) = self.target_model_key.as_deref() else {
+                    return Ok(FilterAction::Continue);
+                };
+                let Some(physical) = ctx.get_metadata(target_key) else {
+                    return Ok(FilterAction::Continue);
+                };
+                let Some(logical_key) = self.logical_model_key.as_deref() else {
+                    return Ok(FilterAction::Continue);
+                };
+                let Some(logical) = ctx.get_metadata(logical_key) else {
+                    return Ok(FilterAction::Reject(responses_error_rejection(
+                        400,
+                        "invalid_request_error",
+                        "selected route is missing its logical model",
+                        streaming,
+                    )));
+                };
+                match apply_selected_candidate(obj, logical, physical, streaming) {
+                    Ok(result) => result,
+                    Err(action) => return Ok(action),
+                }
+            }
+            ModelRewriteSource::Metadata => {
+                let Some(target_key) = self.target_model_key.as_deref() else {
+                    return Ok(FilterAction::Continue);
+                };
+                let Some(physical) = ctx.get_metadata(target_key) else {
+                    return Ok(FilterAction::Continue);
+                };
+                let Some(logical_key) = self.logical_model_key.as_deref() else {
+                    return Ok(FilterAction::Continue);
+                };
+                let Some(logical) = ctx.get_metadata(logical_key) else {
+                    return Ok(FilterAction::Reject(responses_error_rejection(
+                        400,
+                        "invalid_request_error",
+                        "metadata-driven route is missing its logical model",
+                        streaming,
+                    )));
+                };
+                match apply_selected_candidate(obj, logical, physical, streaming) {
+                    Ok(result) => result,
+                    Err(action) => return Ok(action),
+                }
+            }
+        };
         promote_facts(ctx, &result, &self.headers);
 
         if !result.mutated {
@@ -188,13 +283,56 @@ impl HttpFilter for ModelRewriteFilter {
             return Ok(FilterAction::Continue);
         }
 
-        if !is_responses_create(&ctx.request.method, ctx.request.uri.path()) {
+        let supported = match self.source {
+            ModelRewriteSource::Static => is_responses_create(&ctx.request.method, ctx.request.uri.path()),
+            ModelRewriteSource::SelectedCandidate => is_model_create(&ctx.request.method, ctx.request.uri.path()),
+            ModelRewriteSource::Metadata => is_model_create(&ctx.request.method, ctx.request.uri.path()),
+        };
+        if !supported {
             trace!("skipping non-create request");
             return Ok(FilterAction::Continue);
         }
 
         self.rewrite_body(ctx, body)
     }
+}
+
+/// Apply the physical model selected by `intelligent_route`.
+fn apply_selected_candidate(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    logical: &str,
+    physical: &str,
+    streaming: bool,
+) -> Result<RewriteResult, FilterAction> {
+    let Some(model) = obj.get("model").and_then(serde_json::Value::as_str) else {
+        return Err(FilterAction::Reject(responses_error_rejection(
+            400,
+            "invalid_request_error",
+            "selected-candidate model rewrite requires a string model",
+            streaming,
+        )));
+    };
+    if model != logical {
+        return Err(FilterAction::Reject(responses_error_rejection(
+            400,
+            "invalid_request_error",
+            "request model does not match the selected logical model",
+            streaming,
+        )));
+    }
+
+    obj.insert("model".to_owned(), serde_json::Value::String(physical.to_owned()));
+    Ok(RewriteResult {
+        default_injected: false,
+        effective_model: physical.to_owned(),
+        mutated: physical != logical,
+        original_model: Some(logical.to_owned()),
+        rewritten: physical != logical,
+    })
+}
+
+fn is_model_create(method: &http::Method, path: &str) -> bool {
+    *method == http::Method::POST && matches!(path, "/v1/responses" | "/v1/chat/completions")
 }
 
 // -----------------------------------------------------------------------------
