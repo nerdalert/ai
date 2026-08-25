@@ -2765,6 +2765,7 @@ mod tests {
                 name: Arc::from("llama"),
                 rank: None,
                 selection_group: None,
+                traffic_weight: None,
                 selection_tier: None,
                 site: Arc::from("s"),
                 stable_id: descriptor::default_stable_id(CapabilityKind::InferenceModel, "llama", "s", cluster),

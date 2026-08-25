@@ -23,9 +23,22 @@ pub(crate) struct SelectionGroup {
     /// are retained as separate slots, so duplication intentionally acts as a
     /// producer-controlled selection weight.
     pub(crate) candidate_indexes: Vec<usize>,
+    /// Candidate indexes and cumulative bounds for weighted selection.
+    pub(crate) weighted_entries: Vec<WeightedEntry>,
+    /// Sum of the explicit weights for this group.
+    pub(crate) total_weight: u64,
     /// State belongs to this snapshot and therefore resets only on a real
     /// semantic snapshot replacement.
     pub(crate) next: AtomicUsize,
+}
+
+/// One precomputed weighted-selection bucket.
+#[derive(Debug)]
+pub(crate) struct WeightedEntry {
+    /// Index into the immutable candidate array.
+    pub(crate) candidate_index: usize,
+    /// Exclusive upper bound for the random draw.
+    pub(crate) cumulative_upper_bound: u64,
 }
 
 /// Precomputed capability lookup used by the request path.
@@ -77,6 +90,7 @@ pub(crate) fn build(candidates: &[RouteCandidate]) -> Result<GroupIndex, FilterE
                     .into());
                 }
                 group.candidate_indexes.push(candidate_index);
+                append_weight(group, candidate_index, candidate)?;
                 continue;
             },
             Some(group) if number != group.number.saturating_add(1) => {
@@ -88,15 +102,40 @@ pub(crate) fn build(candidates: &[RouteCandidate]) -> Result<GroupIndex, FilterE
             _ => {},
         }
 
-        groups.push(SelectionGroup {
+        let mut group = SelectionGroup {
             number,
             admission_state: candidate.admission_state,
             candidate_indexes: vec![candidate_index],
+            weighted_entries: Vec::new(),
+            total_weight: 0,
             next: AtomicUsize::new(0),
-        });
+        };
+        append_weight(&mut group, candidate_index, candidate)?;
+        groups.push(group);
     }
 
     Ok(index)
+}
+
+/// Append one candidate's bounded weight to the group's cumulative buckets.
+fn append_weight(
+    group: &mut SelectionGroup,
+    candidate_index: usize,
+    candidate: &RouteCandidate,
+) -> Result<(), FilterError> {
+    let Some(weight) = candidate.traffic_weight else {
+        return Ok(());
+    };
+    let total = group
+        .total_weight
+        .checked_add(u64::from(weight))
+        .ok_or_else(|| FilterError::from("routing: traffic weights overflow"))?;
+    group.total_weight = total;
+    group.weighted_entries.push(WeightedEntry {
+        candidate_index,
+        cumulative_upper_bound: total,
+    });
+    Ok(())
 }
 
 #[cfg(test)]
@@ -119,6 +158,7 @@ mod tests {
             name: Arc::from("model"),
             rank: None,
             selection_group: group,
+            traffic_weight: None,
             selection_tier: None,
             site: Arc::from("site"),
             stable_id: Arc::from("stable"),
