@@ -7,7 +7,7 @@ Exact provider-local mapping from an authenticated intelligent routing selection
 
 ## Configuration Notes
 
-The provider listener requires downstream mTLS and must run `peer_identity_trust` before this filter. The filter consumes the exact `x-ai-routing-candidate`, `x-ai-routing-request-id`, and optional `x-ai-routing-revision` fields, validates candidate/model/path against provider-local configuration, and removes all `x-ai-routing-*` peer fields before the backend hop. It also removes client-supplied provider attribution fields before writing provider-owned replacements. A valid peer overlay revision is rewritten into the provider-owned namespace for backend telemetry; it is correlation evidence, not an authorization grant.
+The provider listener requires downstream mTLS and must run `peer_identity_trust` before this filter. The filter consumes the exact `x-ai-routing-candidate`, `x-ai-routing-request-id`, and optional `x-ai-routing-revision` fields, validates candidate/model/path against provider-local configuration, and removes all `x-ai-routing-*` peer fields before the backend hop. It also removes client-supplied provider attribution fields before writing provider-owned replacements. A valid peer overlay revision is rewritten into the provider-owned namespace for backend telemetry; it is correlation evidence, not an authorization grant. When `overlay_revision` is configured, the peer revision must match the route-map revision; missing or mismatched revisions are rejected before backend selection.
 
 These names are AI-owned rather than Praxis-reserved because Praxis intentionally strips `x-praxis-*` headers before upstream requests. Praxis AI startup validation rejects optional/plaintext client certificate modes, a provider chain that does not begin with `peer_identity_trust`, conditional/fail-open boundary filters, and branch-conditional provider consumers.
 
@@ -18,6 +18,7 @@ These names are AI-owned rather than Praxis-reserved because Praxis intentionall
 | `provider_id` | string | yes | Provider-owned identifier used for observability and demo attribution. |
 | `model_header` | string | no | Header populated by an inference parser with the requested model. |
 | `routes` | ProviderRouteConfig[] | yes | Exact provider-local candidate mappings. |
+| `overlay_revision` | string | no | Content-addressed 64-character routing revision sealed to this provider route map. When present, it must match `x-ai-routing-revision` on every request. |
 | `routes[].candidate_id` | string | yes | Stable candidate ID selected by the edge `intelligent_route`. |
 | `routes[].cluster` | string | yes | Provider-local backend cluster. |
 | `routes[].credential` | CandidateCredential | no | Optional provider-local credential reference for the final API hop. |
