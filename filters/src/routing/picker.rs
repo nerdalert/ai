@@ -50,14 +50,15 @@ fn select_from_group<'a>(
     if group.admission_state != AdmissionState::NewAndExisting {
         return None;
     }
-    let ordinal = choose_ordinal(policy, group.candidate_indexes.len(), &group.next);
-    select_from_group_at(candidates, group, ordinal)
+    let candidate_index = choose_candidate_index(policy, group, &group.next)?;
+    candidates.get(candidate_index)
 }
 
 /// Select a specific member of a prevalidated group.
 ///
 /// This small ordinal seam keeps policy tests deterministic without changing
 /// production randomness or making the request path injectable at runtime.
+#[cfg(test)]
 fn select_from_group_at<'a>(
     candidates: &'a [RouteCandidate],
     group: &SelectionGroup,
@@ -70,26 +71,57 @@ fn select_from_group_at<'a>(
 }
 
 /// Resolve a policy to an index inside a non-empty selection group.
-fn choose_ordinal(policy: PickerPolicy, len: usize, counter: &AtomicUsize) -> usize {
+fn choose_candidate_index(policy: PickerPolicy, group: &SelectionGroup, counter: &AtomicUsize) -> Option<usize> {
+    let len = group.candidate_indexes.len();
+    if len == 0 {
+        return None;
+    }
     match policy {
-        PickerPolicy::Deterministic => 0,
-        PickerPolicy::RoundRobin => counter.fetch_add(1, Ordering::Relaxed) % len,
-        PickerPolicy::Random => rand::rng().random_range(0..len),
+        PickerPolicy::Deterministic => group.candidate_indexes.first().copied(),
+        PickerPolicy::RoundRobin => group
+            .candidate_indexes
+            .get(counter.fetch_add(1, Ordering::Relaxed) % len)
+            .copied(),
+        PickerPolicy::Random => group.candidate_indexes.get(rand::rng().random_range(0..len)).copied(),
+        PickerPolicy::WeightedRandom => {
+            if group.total_weight == 0 {
+                return None;
+            }
+            let draw = rand::rng().random_range(0..group.total_weight);
+            let ordinal = group
+                .weighted_entries
+                .partition_point(|entry| entry.cumulative_upper_bound <= draw);
+            group.weighted_entries.get(ordinal).map(|entry| entry.candidate_index)
+        },
     }
 }
 
+/// Map a draw in `[0, total_weight)` to the first cumulative bucket.
 #[cfg(test)]
-#[expect(clippy::unwrap_used, reason = "test assertions")]
+fn weighted_ordinal(cumulative_weights: &[u64], draw: u64) -> Option<usize> {
+    if cumulative_weights.is_empty() {
+        return None;
+    }
+    let ordinal = cumulative_weights.partition_point(|&end| end <= draw);
+    (ordinal < cumulative_weights.len()).then_some(ordinal)
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    reason = "test assertions use fixed-size fixtures"
+)]
 mod tests {
     use std::sync::{Arc, atomic::AtomicUsize};
 
     use super::{
         super::{
             descriptor::{AdmissionState, CapabilityKind, RouteCandidate},
-            group_index,
+            group_index::{self, SelectionGroup},
             overlay::PickerPolicy,
         },
-        choose_ordinal, select_candidate, select_from_group_at,
+        choose_candidate_index, select_candidate, select_from_group_at, weighted_ordinal,
     };
 
     fn candidate(cluster: &str, group: Option<u32>, admission: AdmissionState) -> RouteCandidate {
@@ -102,6 +134,7 @@ mod tests {
             name: Arc::from("model"),
             rank: None,
             selection_group: group,
+            traffic_weight: None,
             selection_tier: None,
             site: Arc::from("site"),
             stable_id: Arc::from(cluster),
@@ -213,8 +246,61 @@ mod tests {
     #[test]
     fn round_robin_counter_wraps_without_leaving_group() {
         let counter = AtomicUsize::new(usize::MAX);
-        assert_eq!(choose_ordinal(PickerPolicy::RoundRobin, 2, &counter), usize::MAX % 2);
-        assert_eq!(choose_ordinal(PickerPolicy::RoundRobin, 2, &counter), 0);
+        let group = SelectionGroup {
+            number: 0,
+            admission_state: AdmissionState::NewAndExisting,
+            candidate_indexes: vec![0, 1],
+            weighted_entries: Vec::new(),
+            total_weight: 0,
+            next: AtomicUsize::new(0),
+        };
+        assert_eq!(
+            choose_candidate_index(PickerPolicy::RoundRobin, &group, &counter),
+            Some(usize::MAX % 2)
+        );
+        assert_eq!(
+            choose_candidate_index(PickerPolicy::RoundRobin, &group, &counter),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn weighted_ordinal_uses_explicit_cumulative_buckets() {
+        let cumulative = [60, 90, 100];
+        assert_eq!(weighted_ordinal(&cumulative, 0), Some(0));
+        assert_eq!(weighted_ordinal(&cumulative, 59), Some(0));
+        assert_eq!(weighted_ordinal(&cumulative, 60), Some(1));
+        assert_eq!(weighted_ordinal(&cumulative, 89), Some(1));
+        assert_eq!(weighted_ordinal(&cumulative, 90), Some(2));
+        assert_eq!(weighted_ordinal(&cumulative, 99), Some(2));
+        assert_eq!(weighted_ordinal(&cumulative, 100), None);
+    }
+
+    #[test]
+    fn weighted_selection_uses_candidate_weights() {
+        let mut candidates = vec![
+            candidate("a", Some(0), AdmissionState::NewAndExisting),
+            candidate("b", Some(0), AdmissionState::NewAndExisting),
+        ];
+        candidates[0].traffic_weight = Some(3);
+        candidates[1].traffic_weight = Some(1);
+        let groups = group_index::build(&candidates).unwrap();
+        let mut counts = [0_u32; 2];
+        for _ in 0..10_000 {
+            let selected = select_candidate(
+                &candidates,
+                &groups,
+                CapabilityKind::InferenceModel,
+                "model",
+                PickerPolicy::WeightedRandom,
+            )
+            .unwrap()
+            .0;
+            let index = if selected.cluster.as_ref() == "a" { 0 } else { 1 };
+            counts[index] += 1;
+        }
+        assert!(counts[0] > 6_500, "3:1 weighted candidate under-selected: {counts:?}");
+        assert!(counts[0] < 8_500, "3:1 weighted candidate over-selected: {counts:?}");
     }
 
     #[test]

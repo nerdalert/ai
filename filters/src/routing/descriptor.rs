@@ -214,6 +214,9 @@ pub(crate) struct RouteCandidate {
     /// Producer-assigned priority group (lower is preferred).
     pub selection_group: Option<u32>,
 
+    /// Optional explicit traffic weight for weighted selection.
+    pub traffic_weight: Option<u32>,
+
     /// Producer-assigned locality tier (e.g. `"same_region"`).
     pub selection_tier: Option<Arc<str>>,
 
@@ -261,12 +264,21 @@ pub(crate) fn default_stable_id(kind: CapabilityKind, name: &str, site: &str, cl
 /// - the candidate list is empty or exceeds [`MAX_CANDIDATES`]
 /// - any name/site/cluster field is blank or oversized
 /// - duplicate (kind, name, site, cluster) tuples exist
+pub(crate) fn validate_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<RouteCandidate>, FilterError> {
+    validate_candidates_with_empty_policy(raw, false)
+}
+
+/// Validate candidates while allowing an empty list for a structurally valid
+/// no-route overlay.
 #[expect(
     clippy::too_many_lines,
     reason = "single validation loop, splitting hurts readability"
 )]
-pub(crate) fn validate_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<RouteCandidate>, FilterError> {
-    if raw.is_empty() {
+pub(crate) fn validate_candidates_with_empty_policy(
+    raw: Vec<CandidateConfig>,
+    allow_empty: bool,
+) -> Result<Vec<RouteCandidate>, FilterError> {
+    if raw.is_empty() && !allow_empty {
         return Err("routing: candidates list must not be empty".into());
     }
     if raw.len() > MAX_CANDIDATES {
@@ -303,6 +315,7 @@ pub(crate) fn validate_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<Route
             name: Arc::from(c.name.as_str()),
             rank: None,
             selection_group: None,
+            traffic_weight: None,
             selection_tier: None,
             site: Arc::from(c.site.as_str()),
             stable_id,

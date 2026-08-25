@@ -237,6 +237,8 @@ pub(crate) enum PickerPolicy {
     RoundRobin,
     /// Select a candidate uniformly at random from the active group.
     Random,
+    /// Select candidates according to their explicit traffic weights.
+    WeightedRandom,
 }
 
 impl PickerPolicy {
@@ -246,16 +248,40 @@ impl PickerPolicy {
             Self::Deterministic => "deterministic",
             Self::RoundRobin => "round_robin",
             Self::Random => "random",
+            Self::WeightedRandom => "weighted_random",
         }
     }
 }
 
 /// Wire wrapper kept extensible independently from routing and scoring policy.
 #[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct SelectionPolicy {
     /// Selection mode applied locally by `intelligent_route`.
     pub(crate) mode: PickerPolicy,
+
+    /// Optional grouping metadata produced by Grid. It is carried for
+    /// observability and forward compatibility; grouping is resolved before
+    /// the immutable overlay reaches the request path.
+    #[allow(dead_code)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) grouping: Option<SelectionGrouping>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SelectionGrouping {
+    #[allow(dead_code)]
+    pub(crate) locality_scope: LocalityGroupingScope,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum LocalityGroupingScope {
+    SameSite,
+    SameZone,
+    SameRegion,
+    AnyEligible,
 }
 
 /// A single routing candidate from the overlay.
@@ -294,6 +320,10 @@ pub(crate) struct OverlayCandidate {
     /// Producer-defined priority group. Lower groups are attempted first.
     #[serde(default)]
     pub(crate) selection_group: Option<u32>,
+
+    /// Optional explicit traffic weight for weighted selection.
+    #[serde(default)]
+    pub(crate) traffic_weight: Option<u32>,
 
     /// Producer-assigned locality tier (e.g. `"same_region"`).
     #[serde(default)]
@@ -513,14 +543,15 @@ impl RouteSnapshot {
             validate_expected_scope(expected, &envelope.scope)?;
         }
 
-        descriptor::validate_local_site(&envelope.overlay.local_site)?;
-        let candidates = overlay_to_candidates(&envelope.overlay)?;
-        let group_index = group_index::build(&candidates)?;
-        let generated_at = envelope.overlay.generated_at.map(|s| Arc::from(s.as_str()));
         let selection_mode = envelope
             .overlay
             .selection_policy
             .map_or(PickerPolicy::Deterministic, |policy| policy.mode);
+        descriptor::validate_local_site(&envelope.overlay.local_site)?;
+        let candidates = overlay_to_candidates(&envelope.overlay, selection_mode)?;
+        let group_index = group_index::build(&candidates)?;
+        let generated_at = envelope.overlay.generated_at.map(|s| Arc::from(s.as_str()));
+        validate_selection_mode(&candidates, selection_mode)?;
 
         Ok(Self {
             candidates,
@@ -540,13 +571,14 @@ impl RouteSnapshot {
         let doc: OverlayDocument = serde_json::from_slice(content)
             .map_err(|e| FilterError::from(format!("routing: overlay parse error: {e}")))?;
 
-        descriptor::validate_local_site(&doc.local_site)?;
-        let candidates = overlay_to_candidates(&doc)?;
-        let group_index = group_index::build(&candidates)?;
-        let generated_at = doc.generated_at.map(|s| Arc::from(s.as_str()));
         let selection_mode = doc
             .selection_policy
             .map_or(PickerPolicy::Deterministic, |policy| policy.mode);
+        descriptor::validate_local_site(&doc.local_site)?;
+        let candidates = overlay_to_candidates(&doc, selection_mode)?;
+        let group_index = group_index::build(&candidates)?;
+        let generated_at = doc.generated_at.map(|s| Arc::from(s.as_str()));
+        validate_selection_mode(&candidates, selection_mode)?;
 
         Ok(Self {
             candidates,
@@ -719,12 +751,32 @@ fn validate_expected_scope(expected: &ExpectedOverlayScope, scope: &ScopeField) 
     Ok(())
 }
 
+/// Validate the cross-field contract for weighted selection.
+fn validate_selection_mode(candidates: &[RouteCandidate], mode: PickerPolicy) -> Result<(), FilterError> {
+    if mode != PickerPolicy::WeightedRandom {
+        if candidates.iter().any(|candidate| candidate.traffic_weight.is_some()) {
+            return Err("routing: traffic_weight is only valid with weightedRandom selection".into());
+        }
+        return Ok(());
+    }
+    if candidates
+        .iter()
+        .any(|candidate| candidate.selection_group.is_none() || candidate.traffic_weight.is_none())
+    {
+        return Err("routing: weightedRandom requires selection_group and traffic_weight on every candidate".into());
+    }
+    Ok(())
+}
+
 // -----------------------------------------------------------------------------
 // Overlay → RouteCandidate conversion
 // -----------------------------------------------------------------------------
 
 /// Convert overlay candidates to validated [`RouteCandidate`]s.
-fn overlay_to_candidates(doc: &OverlayDocument) -> Result<Vec<RouteCandidate>, FilterError> {
+fn overlay_to_candidates(
+    doc: &OverlayDocument,
+    selection_mode: PickerPolicy,
+) -> Result<Vec<RouteCandidate>, FilterError> {
     let raw: Vec<CandidateConfig> = doc
         .candidates
         .iter()
@@ -748,7 +800,8 @@ fn overlay_to_candidates(doc: &OverlayDocument) -> Result<Vec<RouteCandidate>, F
         })
         .collect::<Result<Vec<_>, FilterError>>()?;
 
-    let mut candidates = descriptor::validate_candidates(raw)?;
+    let mut candidates =
+        descriptor::validate_candidates_with_empty_policy(raw, selection_mode == PickerPolicy::WeightedRandom)?;
     enrich_from_overlay(&mut candidates, &doc.candidates)?;
     Ok(candidates)
 }
@@ -773,6 +826,12 @@ pub(super) fn enrich_from_overlay(
         }
         c.rank = oc.rank;
         c.selection_group = oc.selection_group;
+        if let Some(weight) = oc.traffic_weight
+            && !(1..=1000).contains(&weight)
+        {
+            return Err(format!("routing: candidate {i}: traffic_weight must be between 1 and 1000").into());
+        }
+        c.traffic_weight = oc.traffic_weight;
         if let Some(t) = &oc.selection_tier {
             if t.trim().is_empty() || t.len() > 128 {
                 return Err(format!("routing: candidate {i}: selection_tier must be 1-128 non-blank bytes").into());
@@ -1258,6 +1317,40 @@ mod tests {
         let snapshot = RouteSnapshot::from_overlay(json.as_bytes()).unwrap();
         assert_eq!(snapshot.selection_mode, PickerPolicy::RoundRobin);
         assert_eq!(snapshot.candidates[0].selection_group, Some(0));
+    }
+
+    #[test]
+    fn weighted_policy_accepts_valid_candidates_and_empty_overlay() {
+        let json = r#"{
+            "local_site": "site-a",
+            "selection_policy": {"mode": "weightedRandom"},
+            "candidates": [
+                {"kind":"inference_model","name":"m","site":"a","cluster":"a","selection_group":0,"traffic_weight":60},
+                {"kind":"inference_model","name":"m","site":"b","cluster":"b","selection_group":0,"traffic_weight":40}
+            ]
+        }"#;
+        let snapshot = RouteSnapshot::from_overlay(json.as_bytes()).unwrap();
+        assert_eq!(snapshot.selection_mode, PickerPolicy::WeightedRandom);
+        assert_eq!(snapshot.candidates.len(), 2);
+
+        let empty = r#"{
+            "local_site": "site-a",
+            "selection_policy": {"mode": "weightedRandom"},
+            "candidates": []
+        }"#;
+        let snapshot = RouteSnapshot::from_overlay(empty.as_bytes()).unwrap();
+        assert!(snapshot.candidates.is_empty());
+        assert!(snapshot.group_index.is_empty());
+    }
+
+    #[test]
+    fn weighted_policy_rejects_legacy_picker_field() {
+        let json = r#"{
+            "local_site": "site-a",
+            "selection_policy": {"picker": "weightedRandom"},
+            "candidates": []
+        }"#;
+        assert!(RouteSnapshot::from_overlay(json.as_bytes()).is_err());
     }
 
     #[test]
