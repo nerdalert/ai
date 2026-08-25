@@ -57,6 +57,16 @@ struct ProviderRouteFilterConfig {
     /// Exact provider-local candidate mappings.
     routes: Vec<ProviderRouteConfig>,
 
+    /// Semantic routing revision for the route map.
+    ///
+    /// When present, this must match the revision pinned by the upstream
+    /// `intelligent_route` selection on every request.  This prevents a
+    /// provider gateway from combining a candidate selected from one Grid
+    /// snapshot with a route map from another snapshot.  It is optional for
+    /// mixed-version rollouts; omitted retains the legacy contract.
+    #[serde(default)]
+    overlay_revision: Option<String>,
+
     /// Add a provider attribution response header for demo evidence.
     #[serde(default)]
     emit_demo_attribution: bool,
@@ -131,6 +141,8 @@ pub struct ProviderRouteFilter {
     provider_id_header: HeaderValue,
     /// Candidate-to-route map.
     routes: HashMap<Arc<str>, ProviderRoute>,
+    /// Expected semantic revision for this route map, when configured.
+    overlay_revision: Option<Arc<str>>,
 }
 
 impl ProviderRouteFilter {
@@ -153,6 +165,11 @@ impl ProviderRouteFilter {
         }
 
         let model_header = descriptor::validate_model_header(&cfg.model_header)?;
+        let overlay_revision = cfg
+            .overlay_revision
+            .as_deref()
+            .map(validate_overlay_revision)
+            .transpose()?;
         let mut routes = HashMap::with_capacity(cfg.routes.len());
         for route in cfg.routes {
             validate_route(&route)?;
@@ -174,6 +191,7 @@ impl ProviderRouteFilter {
             provider_id: Arc::from(cfg.provider_id.as_str()),
             provider_id_header,
             routes,
+            overlay_revision,
         }))
     }
 }
@@ -205,6 +223,23 @@ impl HttpFilter for ProviderRouteFilter {
             Ok(revision) => revision.map(str::to_owned),
             Err(InvalidPeerOverlayRevision) => return Ok(FilterAction::Reject(Rejection::status(403))),
         };
+        if let Some(expected_revision) = &self.overlay_revision {
+            let Some(peer_revision) = overlay_revision.as_deref() else {
+                tracing::warn!(
+                    expected_revision = %expected_revision,
+                    "provider_route: missing routing revision for sealed route map"
+                );
+                return Ok(FilterAction::Reject(Rejection::status(503)));
+            };
+            if peer_revision != expected_revision.as_ref() {
+                tracing::warn!(
+                    expected_revision = %expected_revision,
+                    peer_revision,
+                    "provider_route: routing revision mismatch; retaining route-map boundary"
+                );
+                return Ok(FilterAction::Reject(Rejection::status(503)));
+            }
+        }
         let Some(model) = request_header_by_name(ctx, &self.model_header).map(str::to_owned) else {
             return Ok(FilterAction::Reject(Rejection::status(400)));
         };
@@ -309,6 +344,18 @@ fn peer_overlay_revision<'a>(ctx: &'a HttpFilterContext<'_>) -> Result<Option<&'
         return Err(InvalidPeerOverlayRevision);
     }
     Ok(Some(value))
+}
+
+/// Validate a configured content-addressed routing revision.
+fn validate_overlay_revision(revision: &str) -> Result<Arc<str>, FilterError> {
+    if revision.len() != 64
+        || !revision
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err("provider_route: overlay_revision must be 64 lowercase hexadecimal characters".into());
+    }
+    Ok(Arc::from(revision))
 }
 
 /// Extract a bounded, non-empty header value by static name.
@@ -573,6 +620,46 @@ mod tests {
         let action = f.on_request(&mut ctx).await.unwrap();
         assert!(matches!(action, FilterAction::Continue), "should route");
         assert_eq!(ctx.cluster.as_deref(), Some("mock-backend"));
+    }
+
+    #[tokio::test]
+    async fn sealed_route_map_requires_matching_revision() {
+        let f = revision_filter("abc123");
+        let req = request_with_peer_context("/v1/chat/completions", "abc123", "req-1", "sim-model-v1");
+        let mut ctx = test_utils::make_filter_context(&req);
+
+        let action = f.on_request(&mut ctx).await.unwrap();
+
+        assert!(matches!(action, FilterAction::Continue));
+    }
+
+    #[tokio::test]
+    async fn sealed_route_map_rejects_missing_revision_without_partial_route() {
+        let f = revision_filter("abc123");
+        let mut req = request_with_peer_context("/v1/chat/completions", "abc123", "req-1", "sim-model-v1");
+        req.headers.remove(OVERLAY_REVISION_HEADER);
+        let mut ctx = test_utils::make_filter_context(&req);
+
+        let action = f.on_request(&mut ctx).await.unwrap();
+
+        assert!(matches!(action, FilterAction::Reject(r) if r.status == 503));
+        assert!(ctx.cluster.is_none(), "mismatched snapshots must not select a backend");
+    }
+
+    #[tokio::test]
+    async fn sealed_route_map_rejects_mismatched_revision_without_partial_route() {
+        let f = revision_filter("abc123");
+        let mut req = request_with_peer_context("/v1/chat/completions", "abc123", "req-1", "sim-model-v1");
+        req.headers.insert(
+            HeaderName::from_static(OVERLAY_REVISION_HEADER),
+            HeaderValue::from_static("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        );
+        let mut ctx = test_utils::make_filter_context(&req);
+
+        let action = f.on_request(&mut ctx).await.unwrap();
+
+        assert!(matches!(action, FilterAction::Reject(r) if r.status == 503));
+        assert!(ctx.cluster.is_none(), "mismatched snapshots must not select a backend");
     }
 
     #[tokio::test]
@@ -910,6 +997,13 @@ mod tests {
     }
 
     #[test]
+    fn invalid_overlay_revision_rejected() {
+        let mut config = provider_config("a", "m", &["/x"], "c");
+        config["overlay_revision"] = serde_yaml::Value::from("not-a-revision");
+        assert!(ProviderRouteFilter::from_config(&config).is_err());
+    }
+
+    #[test]
     fn duplicate_path_rejected() {
         let config = provider_config("a", "m", &["/x", "/x"], "c");
         assert!(ProviderRouteFilter::from_config(&config).is_err());
@@ -982,6 +1076,13 @@ mod tests {
 
     fn make_filter(candidate_id: &str) -> Box<dyn HttpFilter> {
         let config = provider_config(candidate_id, "sim-model-v1", &["/v1/chat/completions"], "mock-backend");
+        ProviderRouteFilter::from_config(&config).unwrap()
+    }
+
+    fn revision_filter(candidate_id: &str) -> Box<dyn HttpFilter> {
+        let mut config = provider_config(candidate_id, "sim-model-v1", &["/v1/chat/completions"], "mock-backend");
+        config["overlay_revision"] =
+            serde_yaml::Value::from("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         ProviderRouteFilter::from_config(&config).unwrap()
     }
 
