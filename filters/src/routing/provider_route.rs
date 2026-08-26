@@ -27,7 +27,8 @@ use super::{
         CandidateCredential, OVERLAY_REVISION_HEADER, PROVIDER_ATTRIBUTION_HEADER,
         PROVIDER_ATTRIBUTION_RESPONSE_HEADER, PROVIDER_HOP_REQUEST_ID_HEADER, PROVIDER_OVERLAY_REVISION_HEADER,
         PROVIDER_REQUEST_ID_HEADER, PROVIDER_ROUTE_CANDIDATE_ID, PROVIDER_ROUTE_CLUSTER, PROVIDER_ROUTE_MODEL,
-        PROVIDER_ROUTE_OVERLAY_REVISION, PROVIDER_ROUTE_PROVIDER_ID, PROVIDER_ROUTE_REQUEST_ID,
+        PROVIDER_ROUTE_OVERLAY_REVISION, PROVIDER_ROUTE_PROVIDER_ID, PROVIDER_ROUTE_PROVIDER_MODEL,
+        PROVIDER_ROUTE_REQUEST_ID,
         SELECTED_CANDIDATE_HEADER, set_credential_metadata,
     },
 };
@@ -88,6 +89,12 @@ struct ProviderRouteConfig {
     /// Exact model accepted for this candidate.
     model: String,
 
+    /// Optional provider-facing model. The request remains matched and
+    /// attributed by `model`; this value is exposed only as trusted metadata
+    /// for a following model-rewrite filter.
+    #[serde(default)]
+    provider_model: Option<String>,
+
     /// Exact inference paths accepted for this candidate.
     paths: Vec<String>,
 }
@@ -106,6 +113,8 @@ struct ProviderRoute {
     credential: Option<CandidateCredential>,
     /// Accepted model name.
     model: Arc<str>,
+    /// Optional provider-facing model for logical-to-physical translation.
+    provider_model: Option<Arc<str>>,
     /// Accepted request paths.
     paths: Vec<Arc<str>>,
 }
@@ -178,6 +187,7 @@ impl ProviderRouteFilter {
                 cluster: Arc::from(route.cluster.as_str()),
                 credential: route.credential,
                 model: Arc::from(route.model.as_str()),
+                provider_model: route.provider_model.map(|model| Arc::from(model.as_str())),
                 paths: route.paths.into_iter().map(Arc::from).collect(),
             };
             if routes.insert(candidate_id, provider_route).is_some() {
@@ -254,6 +264,9 @@ impl HttpFilter for ProviderRouteFilter {
         ctx.set_metadata(PROVIDER_ROUTE_CANDIDATE_ID, &candidate_id);
         ctx.set_metadata(PROVIDER_ROUTE_CLUSTER, &*route.cluster);
         ctx.set_metadata(PROVIDER_ROUTE_MODEL, &model);
+        if let Some(provider_model) = &route.provider_model {
+            ctx.set_metadata(PROVIDER_ROUTE_PROVIDER_MODEL, &**provider_model);
+        }
         ctx.set_metadata(PROVIDER_ROUTE_PROVIDER_ID, &*self.provider_id);
         ctx.set_metadata(PROVIDER_ROUTE_REQUEST_ID, &request_id);
         if let Some(revision) = &overlay_revision {

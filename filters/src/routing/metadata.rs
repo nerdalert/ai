@@ -66,6 +66,8 @@ pub(crate) const PROVIDER_ROUTE_CANDIDATE_ID: &str = "provider_route.candidate_i
 pub(crate) const PROVIDER_ROUTE_CLUSTER: &str = "provider_route.cluster";
 /// Model validated by `provider_route`.
 pub(crate) const PROVIDER_ROUTE_MODEL: &str = "provider_route.model";
+/// Provider-facing physical model selected for this route, when translation is configured.
+pub(crate) const PROVIDER_ROUTE_PROVIDER_MODEL: &str = "provider_route.provider_model";
 /// Provider identity for attribution.
 pub(crate) const PROVIDER_ROUTE_PROVIDER_ID: &str = "provider_route.provider_id";
 /// Provider-scoped request ID.
