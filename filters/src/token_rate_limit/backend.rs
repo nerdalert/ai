@@ -155,10 +155,10 @@ for i = 1, #expired_global do
       local amount = tonumber(string.sub(value, 1, value_split - 1))
       local reserved_at = tonumber(string.sub(value, value_split + 1))
       local bucket = math.floor(reserved_at / bucket_ms) * bucket_ms
-      redis.call('HINCRBY', physical .. ':settled', bucket, amount)
-      redis.call('ZADD', physical .. ':settled-index', bucket, bucket)
+      redis.call('HINCRBY', settled, bucket, amount)
+      redis.call('ZADD', settled_index, bucket, bucket)
       redis.call('HDEL', active_key, reservation)
-      redis.call('DECRBY', physical .. ':active-tokens', amount)
+      redis.call('DECRBY', active_tokens_key, amount)
       active_total = math.max(0, active_total - 1)
     end
   end

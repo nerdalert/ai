@@ -11,8 +11,7 @@ use crate::HttpCalloutFilter;
 use crate::{
     A2aFilter, AiGuardrailsFilter, CredentialInjectFilter, IntelligentRouteFilter, McpFilter, ModelToHeaderFilter,
     PromptEnrichFilter, ProviderRouteFilter, Sigv4SignFilter, TimeToFirstTokenFilter, TokenCountFilter,
-    TokenRateLimitFilter,
-    TokenUsageHeadersFilter,
+    TokenRateLimitFilter, TokenUsageHeadersFilter,
 };
 
 /// Register all in-tree AI HTTP filters into `registry`.

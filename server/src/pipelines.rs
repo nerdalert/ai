@@ -685,6 +685,27 @@ filter_chains:
     }
 
     #[test]
+    fn token_rate_limit_rejects_order_after_intelligent_route() {
+        let (listener, entries) = token_rate_limit_order_parts(&["intelligent_route", "token_rate_limit"]);
+        let error = validate_token_rate_limit_order(&listener, &entries).expect_err("invalid route order should fail");
+        assert!(error.to_string().contains("must precede intelligent_route"));
+    }
+
+    #[test]
+    fn token_rate_limit_rejects_order_after_token_count() {
+        let (listener, entries) = token_rate_limit_order_parts(&["token_count", "token_rate_limit"]);
+        let error = validate_token_rate_limit_order(&listener, &entries).expect_err("invalid count order should fail");
+        assert!(error.to_string().contains("token_count must follow token_rate_limit"));
+    }
+
+    #[test]
+    fn token_rate_limit_accepts_admission_before_route_and_count() {
+        let (listener, entries) =
+            token_rate_limit_order_parts(&["token_rate_limit", "intelligent_route", "token_count"]);
+        validate_token_rate_limit_order(&listener, &entries).expect("valid quota order should pass");
+    }
+
+    #[test]
     fn resolve_pipelines_rejects_misaligned_clusters() {
         let config = Config::from_yaml(
             r#"
@@ -970,5 +991,35 @@ filter_chains:
             "            model: model-a\n",
             "            paths: [/v1/chat/completions]\n",
         )
+    }
+
+    fn token_rate_limit_order_parts(order: &[&str]) -> (Listener, Vec<FilterEntry>) {
+        let listener = Config::from_yaml(
+            r#"
+listeners:
+  - name: quota
+    address: "127.0.0.1:8080"
+    filter_chains: [quota]
+filter_chains:
+  - name: quota
+    filters: []
+"#,
+        )
+        .expect("quota listener config should parse")
+        .listeners[0]
+            .clone();
+        let entries = order
+            .iter()
+            .map(|filter_type| FilterEntry {
+                filter_type: (*filter_type).to_owned(),
+                branch_chains: None,
+                conditions: Vec::new(),
+                name: None,
+                response_conditions: Vec::new(),
+                failure_mode: FailureMode::default(),
+                config: serde_yaml::Value::Null,
+            })
+            .collect();
+        (listener, entries)
     }
 }

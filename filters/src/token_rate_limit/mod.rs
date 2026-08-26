@@ -87,7 +87,7 @@ use self::{
         BackendReserve, BackendSettlement, InMemoryTokenRateLimitBackend, ReconcileRequest, ReserveRequest,
         TokenRateLimitStateBackend, ValkeyBackendConfig, ValkeyTokenRateLimitBackend,
     },
-    ledger::{Budget, Ledger, LedgerConfig},
+    ledger::{Budget, Ledger, LedgerConfig, Settlement},
 };
 
 const META_RESERVATION_ID: &str = "token_rate_limit.reservation_id";
@@ -640,20 +640,35 @@ impl HttpFilter for TokenRateLimitFilter {
                 return Ok(FilterAction::Continue);
             };
             if let Some((ledger, _)) = rule.backend.local_state() {
-                let _ = ledger.reconcile(id, actual, self.now_ms());
+                match ledger.reconcile(id, actual, self.now_ms()) {
+                    Settlement::Applied {
+                        actual,
+                        refund,
+                        overage,
+                    } => {
+                        counter!("praxis_ai_token_rate_limit_reservations_total", "result" => "reconciled")
+                            .increment(1);
+                        counter!("praxis_ai_token_rate_limit_tokens_total", "kind" => "actual").increment(actual);
+                        counter!("praxis_ai_token_rate_limit_tokens_total", "kind" => "refunded").increment(refund);
+                        counter!("praxis_ai_token_rate_limit_tokens_total", "kind" => "overage").increment(overage);
+                    },
+                    Settlement::Noop => {},
+                }
+                self.record_state_metrics();
                 ctx.filter_metadata.remove(META_RESERVATION_ID);
                 ctx.filter_metadata.remove(META_ACTIVE);
                 ctx.filter_metadata.remove(META_KEY);
             } else if let Some(key) = ctx.get_metadata(META_KEY).map(str::to_owned) {
-                rule.backend
-                    .enqueue_reconcile(ReconcileRequest {
-                        key,
-                        reservation_id: id,
-                        actual,
-                        estimate: rule.estimate,
-                        now_ms: self.now_ms(),
-                    })
-                    .map_err(|error| -> FilterError { error.into() })?;
+                if let Err(error) = rule.backend.enqueue_reconcile(ReconcileRequest {
+                    key,
+                    reservation_id: id,
+                    actual,
+                    estimate: rule.estimate,
+                    now_ms: self.now_ms(),
+                }) {
+                    counter!("praxis_ai_token_rate_limit_backend_errors_total", "backend" => "valkey", "operation" => "enqueue_reconcile").increment(1);
+                    tracing::error!(%error, "token-rate-limit: failed to enqueue reconciliation");
+                }
                 ctx.filter_metadata.remove(META_RESERVATION_ID);
                 ctx.filter_metadata.remove(META_ACTIVE);
                 ctx.filter_metadata.remove(META_KEY);
