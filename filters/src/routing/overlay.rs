@@ -582,13 +582,15 @@ impl RouteSnapshot {
 }
 
 /// Warn when a non-deterministic policy has no grouped candidates to select.
-fn warn_if_selection_policy_has_no_groups(selection_mode: PickerPolicy, group_index: &GroupIndex) {
-    if selection_mode != PickerPolicy::Deterministic && group_index.is_empty() {
+fn warn_if_selection_policy_has_no_groups(selection_mode: PickerPolicy, group_index: &GroupIndex) -> bool {
+    let should_warn = selection_mode != PickerPolicy::Deterministic && group_index.is_empty();
+    if should_warn {
         tracing::warn!(
             selection_mode = ?selection_mode,
             "routing: selection policy is set but no candidates have selection_group; policy will not take effect"
         );
     }
+    should_warn
 }
 
 // -----------------------------------------------------------------------------
@@ -1255,6 +1257,18 @@ mod tests {
         let snapshot = RouteSnapshot::from_overlay(json.as_bytes()).unwrap();
         assert_eq!(snapshot.selection_mode, PickerPolicy::RoundRobin);
         assert_eq!(snapshot.candidates[0].selection_group, Some(0));
+    }
+
+    #[test]
+    fn non_deterministic_policy_without_groups_requests_warning() {
+        assert!(warn_if_selection_policy_has_no_groups(
+            PickerPolicy::RoundRobin,
+            &GroupIndex::new(),
+        ));
+        assert!(!warn_if_selection_policy_has_no_groups(
+            PickerPolicy::Deterministic,
+            &GroupIndex::new(),
+        ));
     }
 
     #[test]
@@ -1949,6 +1963,29 @@ mod tests {
     }
 
     #[test]
+    fn semantic_digest_changes_when_only_selection_policy_changes() {
+        let base = serde_json::json!({
+            "local_site": "site-a",
+            "network": "test-net",
+            "candidates": [{
+                "kind": "inference_model",
+                "name": "m",
+                "site": "site-a",
+                "cluster": "c",
+                "selection_group": 0
+            }],
+            "selection_policy": {"mode": "deterministic"}
+        });
+        let mut changed = base.clone();
+        changed["selection_policy"]["mode"] = serde_json::json!("roundRobin");
+
+        assert_ne!(
+            compute_semantic_digest(&base).unwrap(),
+            compute_semantic_digest(&changed).unwrap(),
+        );
+    }
+
+    #[test]
     fn legacy_accepted_without_schema_version() {
         let json = r#"{"local_site":"site-a","candidates":[{"kind":"inference_model","name":"m","site":"site-a","cluster":"c","fresh":true}]}"#;
         let snap = RouteSnapshot::from_overlay(json.as_bytes()).unwrap();
@@ -2320,13 +2357,27 @@ mod tests {
 
     #[test]
     fn semantic_equivalent_rewrite_does_not_replace_picker_state() {
-        let valid = include_bytes!("../../../tests/fixtures/overlay-contract/v1/valid-multi-candidate.json");
-        let timestamp_only =
-            include_bytes!("../../../tests/fixtures/overlay-contract/v1/timestamp-change-same-revision.json");
-        let snapshot = ArcSwap::from_pointee(RouteSnapshot::from_overlay(valid).unwrap());
+        let mut valid: serde_json::Value = serde_json::from_str(&make_envelope_json("site-a", "m", "a", "n")).unwrap();
+        valid["overlay"]["selection_policy"] = serde_json::json!({"mode": "roundRobin"});
+        valid["overlay"]["candidates"][0]["selection_group"] = serde_json::json!(0);
+        let digest = compute_semantic_digest(&valid["overlay"]).unwrap();
+        valid["revision"]["value"] = serde_json::json!(digest);
+        valid["content_digest"]["value"] = valid["revision"]["value"].clone();
 
-        let timestamp_snapshot = RouteSnapshot::from_overlay(timestamp_only).unwrap();
-        assert!(is_semantically_unchanged(&snapshot.load(), &timestamp_snapshot));
+        let initial = serde_json::to_vec(&valid).unwrap();
+        let snapshot = ArcSwap::from_pointee(RouteSnapshot::from_overlay(&initial).unwrap());
+        let before = snapshot.load_full();
+        assert_eq!(before.selection_mode, PickerPolicy::RoundRobin);
+
+        valid["overlay"]["generated_at"] = serde_json::json!("2099-12-31T23:59:59Z");
+        valid["provenance"]["rendered_at"] = serde_json::json!("2099-12-31T23:59:59Z");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overlay.json");
+        std::fs::write(&path, serde_json::to_vec(&valid).unwrap()).unwrap();
+
+        handle_overlay_reload(&path, &snapshot, None);
+
+        assert!(Arc::ptr_eq(&before, &snapshot.load_full()));
     }
 
     fn select_round_robin_cluster(snapshot: &RouteSnapshot) -> String {

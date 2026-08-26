@@ -2230,6 +2230,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grouped_selection_metadata_is_recorded_for_new_and_reused_sessions() {
+        let json = r#"{
+            "local_site":"site-a",
+            "selection_policy":{"mode":"roundRobin"},
+            "candidates":[
+                {"kind":"inference_model","name":"llama","site":"a","cluster":"a","selection_group":0},
+                {"kind":"inference_model","name":"llama","site":"b","cluster":"b","selection_group":0}
+            ]
+        }"#;
+        let snapshot = RouteSnapshot::from_overlay(json.as_bytes()).unwrap();
+        let filter = make_affinity_filter(Arc::new(ArcSwap::from_pointee(snapshot)), Some(make_test_affinity()));
+
+        for expected_reused in ["false", "true"] {
+            let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+            req.headers.insert("X-Model", HeaderValue::from_static("llama"));
+            req.headers
+                .insert("x-session-id", HeaderValue::from_static("sticky-session"));
+            let mut ctx = crate::test_utils::make_filter_context(&req);
+
+            let action = filter.on_request(&mut ctx).await.unwrap();
+
+            assert!(matches!(action, FilterAction::Continue));
+            assert_eq!(ctx.cluster.as_deref(), Some("a"));
+            assert_eq!(ctx.get_metadata("intelligent_route.selection_group"), Some("0"));
+            assert_eq!(
+                ctx.get_metadata("intelligent_route.selection_mode"),
+                Some("round_robin")
+            );
+            assert_eq!(
+                ctx.get_metadata("intelligent_route.session.reused"),
+                Some(expected_reused)
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn cookie_session_key_extraction() {
         let snap = make_overlay_snapshot(&[("new_and_existing", "c-a")]);
         let shared = Arc::new(ArcSwap::from_pointee(snap));

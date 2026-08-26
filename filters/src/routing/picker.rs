@@ -89,7 +89,7 @@ mod tests {
             group_index,
             overlay::PickerPolicy,
         },
-        choose_ordinal, select_candidate, select_from_group_at,
+        choose_ordinal, select_candidate,
     };
 
     fn candidate(cluster: &str, group: Option<u32>, admission: AdmissionState) -> RouteCandidate {
@@ -150,6 +150,25 @@ mod tests {
     }
 
     #[test]
+    fn all_inadmissible_groups_return_no_candidate() {
+        let candidates = vec![
+            candidate("draining", Some(0), AdmissionState::ExistingOnly),
+            candidate("excluded", Some(1), AdmissionState::Excluded),
+        ];
+        let groups = group_index::build(&candidates).unwrap();
+
+        let selected = select_candidate(
+            &candidates,
+            &groups,
+            CapabilityKind::InferenceModel,
+            "model",
+            PickerPolicy::RoundRobin,
+        );
+
+        assert!(selected.is_none());
+    }
+
+    #[test]
     fn ungrouped_overlay_preserves_first_candidate_selection() {
         let candidates = vec![
             candidate("a", None, AdmissionState::NewAndExisting),
@@ -195,19 +214,19 @@ mod tests {
         ];
         let groups = group_index::build(&candidates).unwrap();
 
-        let best_group = groups
-            .get(&CapabilityKind::InferenceModel)
-            .unwrap()
-            .get("model")
-            .unwrap()
-            .first()
+        for _ in 0..128 {
+            let selected = select_candidate(
+                &candidates,
+                &groups,
+                CapabilityKind::InferenceModel,
+                "model",
+                PickerPolicy::Random,
+            )
             .unwrap();
-        let selected_a = select_from_group_at(&candidates, best_group, 0).unwrap();
-        let selected_b = select_from_group_at(&candidates, best_group, 1).unwrap();
 
-        assert_eq!(&*selected_a.cluster, "a");
-        assert_eq!(&*selected_b.cluster, "b");
-        assert_eq!(best_group.number, 0);
+            assert!(matches!(selected.0.cluster.as_ref(), "a" | "b"));
+            assert_eq!(selected.1, Some(0));
+        }
     }
 
     #[test]
