@@ -99,6 +99,7 @@ pub(crate) mod test_utils {
             response_headers_modified: false,
             subrequest_client: None,
             subrequest_response_mode: praxis_filter::SubRequestResponseMode::Buffered,
+            #[cfg(feature = "praxis-main")]
             pinned_endpoint_address: None,
             #[cfg(feature = "praxis-main")]
             attempted_endpoints: Vec::new(),
