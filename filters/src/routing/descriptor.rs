@@ -243,14 +243,29 @@ pub(crate) struct RouteCandidate {
 ///
 /// Used as a fallback when the overlay does not provide an
 /// explicit `stable_id`.
+#[cfg(test)]
 pub(crate) fn default_stable_id(kind: CapabilityKind, name: &str, site: &str, cluster: &str) -> Arc<str> {
-    let readable = format!("{}/{}/{}/{}", kind.as_str(), name, site, cluster);
+    default_stable_id_with_provider_model(kind, name, site, cluster, None)
+}
+
+/// Build a stable ID that also distinguishes provider-facing model mappings.
+pub(crate) fn default_stable_id_with_provider_model(
+    kind: CapabilityKind,
+    name: &str,
+    site: &str,
+    cluster: &str,
+    provider_model: Option<&str>,
+) -> Arc<str> {
+    let readable = provider_model.map_or_else(
+        || format!("{}/{}/{}/{}", kind.as_str(), name, site, cluster),
+        |provider_model| format!("{}/{}/{}/{}/provider_model/{}", kind.as_str(), name, site, cluster, provider_model),
+    );
     if readable.len() <= 256 && readable.parse::<http::HeaderValue>().is_ok() {
         return Arc::from(readable);
     }
 
     let mut digest = Sha256::new();
-    for field in [kind.as_str(), name, site, cluster] {
+    for field in [kind.as_str(), name, site, cluster, provider_model.unwrap_or("")] {
         digest.update(field.len().to_be_bytes());
         digest.update(field.as_bytes());
     }
@@ -294,7 +309,7 @@ pub(crate) fn validate_candidates_with_empty_policy(
     }
 
     let mut candidates = Vec::with_capacity(raw.len());
-    let mut seen: HashSet<(CapabilityKind, String, String, String)> = HashSet::with_capacity(raw.len());
+    let mut seen: HashSet<Arc<str>> = HashSet::with_capacity(raw.len());
 
     for (i, c) in raw.into_iter().enumerate() {
         validate_name(&format!("candidates[{i}].name"), &c.name)?;
@@ -308,7 +323,14 @@ pub(crate) fn validate_candidates_with_empty_policy(
         validate_name(&format!("candidates[{i}].cluster"), &c.cluster)?;
         validate_credential(i, c.credential.as_ref())?;
 
-        if !seen.insert((c.kind, c.name.clone(), c.site.clone(), c.cluster.clone())) {
+        let stable_id = default_stable_id_with_provider_model(
+            c.kind,
+            &c.name,
+            &c.site,
+            &c.cluster,
+            c.provider_model.as_deref(),
+        );
+        if !seen.insert(Arc::clone(&stable_id)) {
             return Err(format!(
                 "routing: duplicate candidate '{}/{}/{}:{}'",
                 c.kind.as_str(),
@@ -319,7 +341,6 @@ pub(crate) fn validate_candidates_with_empty_policy(
             .into());
         }
 
-        let stable_id = default_stable_id(c.kind, &c.name, &c.site, &c.cluster);
         candidates.push(RouteCandidate {
             admission_state: AdmissionState::default(),
             cluster: Arc::from(c.cluster.as_str()),
