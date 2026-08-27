@@ -42,7 +42,9 @@ The configured key and active-reservation limits are per rule for both backends.
 | `rules[].token_budgets` | BudgetConfig[] | yes |  |
 | `rules[].token_budgets[].window` | string | yes |  |
 | `rules[].token_budgets[].capacity` | integer | yes |  |
+| `rules[].enforcement` | `hard` \| `soft` | no |  |
 | `backend` | BackendConfig | no |  |
 | `backend.kind` | `memory` \| `valkey` | no |  |
 | `backend.url` | string | no |  |
 | `backend.namespace` | string | no |  |
+| `enforcement` | `hard` \| `soft` | no |  |

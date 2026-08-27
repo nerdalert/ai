@@ -156,6 +156,7 @@ mod tests {
             fresh: true,
             kind: CapabilityKind::InferenceModel,
             name: Arc::from("model"),
+            provider_model: None,
             rank: None,
             selection_group: group,
             traffic_weight: None,

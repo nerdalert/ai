@@ -86,6 +86,13 @@ pub(super) struct Reservation {
 pub(super) enum Decision {
     /// Request may proceed with this reservation.
     Admitted(Reservation),
+    /// Request proceeds while reporting that a soft budget is exceeded.
+    SoftAdmitted {
+        /// Reservation retained for normal reconciliation.
+        reservation: Reservation,
+        /// Whether the configured budget was already exceeded by this request.
+        over_allocated: bool,
+    },
     /// Request must be rejected before routing.
     Denied {
         /// Conservative delay before another admission attempt.
@@ -249,6 +256,15 @@ impl Ledger {
 
     /// Reserve an estimate atomically across all configured windows.
     pub(super) fn reserve(&self, key: &str, estimate: u64, now_ms: u64) -> Decision {
+        self.reserve_inner(key, estimate, now_ms, false)
+    }
+
+    /// Reserve while allowing a budget over-allocation to proceed.
+    pub(super) fn reserve_soft(&self, key: &str, estimate: u64, now_ms: u64) -> Decision {
+        self.reserve_inner(key, estimate, now_ms, true)
+    }
+
+    fn reserve_inner(&self, key: &str, estimate: u64, now_ms: u64, soft: bool) -> Decision {
         if key.is_empty() || key.len() > self.config.max_key_length || estimate == 0 {
             return Decision::Denied {
                 retry_after_ms: 0,
@@ -286,12 +302,11 @@ impl Ledger {
         }
         self.active_reservations.fetch_sub(expired.len(), Ordering::Relaxed);
 
-        if self
-            .config
-            .budgets
-            .iter()
-            .any(|budget| state.usage_in_window(now_ms, budget.window_ms).saturating_add(estimate) > budget.capacity)
-        {
+        let over_allocated =
+            self.config.budgets.iter().any(|budget| {
+                state.usage_in_window(now_ms, budget.window_ms).saturating_add(estimate) > budget.capacity
+            });
+        if over_allocated && !soft {
             return Decision::Denied {
                 retry_after_ms: state.retry_after_ms(now_ms, &self.config),
                 reason: DenialReason::WindowCapacity,
@@ -320,11 +335,19 @@ impl Ledger {
         );
         self.reservations.insert(id, key.to_owned());
         drop(state);
-        Decision::Admitted(Reservation {
+        let reservation = Reservation {
             id,
             estimate,
             created_at_ms: now_ms,
-        })
+        };
+        if soft {
+            Decision::SoftAdmitted {
+                reservation,
+                over_allocated,
+            }
+        } else {
+            Decision::Admitted(reservation)
+        }
     }
 
     /// Reconcile actual usage. Repeated calls for one ID are no-ops.

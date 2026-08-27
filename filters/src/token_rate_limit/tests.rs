@@ -336,6 +336,51 @@ async fn admitted_request_reconciles_actual_usage_and_allows_refund() {
 }
 
 #[tokio::test]
+async fn soft_enforcement_admits_over_allocation_and_marks_metadata() {
+    let mut value = config();
+    value["enforcement"] = serde_yaml::Value::String("soft".into());
+    value["rules"][0]["token_budgets"][0]["capacity"] = serde_yaml::Value::Number(10.into());
+    let filter = TokenRateLimitFilter::from_config_inner(&value).unwrap();
+    let request = request_with_model("model-a");
+
+    let mut first = crate::test_utils::make_filter_context(&request);
+    first.set_metadata("identity.user_id", "soft-alice");
+    assert!(matches!(
+        filter.on_request(&mut first).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert_eq!(first.get_metadata(META_GOVERNANCE), Some("within"));
+
+    let mut second = crate::test_utils::make_filter_context(&request);
+    second.set_metadata("identity.user_id", "soft-alice");
+    assert!(matches!(
+        filter.on_request(&mut second).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert_eq!(second.get_metadata(META_GOVERNANCE), Some("over_allocation"));
+    let mut response = crate::test_utils::make_response();
+    second.response_header = Some(&mut response);
+    assert!(matches!(
+        filter.on_response(&mut second).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert_eq!(
+        response
+            .headers
+            .get("x-ratelimit-governance")
+            .and_then(|value| value.to_str().ok()),
+        Some("over_allocation")
+    );
+    assert_eq!(
+        response
+            .headers
+            .get("x-ratelimit-limit")
+            .and_then(|value| value.to_str().ok()),
+        Some("10")
+    );
+}
+
+#[tokio::test]
 async fn exhausted_request_is_429_before_any_route_metadata_is_set() {
     let mut value = config();
     set_capacity(&mut value, 10);
