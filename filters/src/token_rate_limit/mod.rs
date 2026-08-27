@@ -75,7 +75,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use http::header::HeaderName;
+use http::header::{HeaderName, HeaderValue};
 use metrics::{counter, gauge};
 use praxis_filter::{
     BodyAccess, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config,
@@ -93,6 +93,7 @@ use self::{
 const META_RESERVATION_ID: &str = "token_rate_limit.reservation_id";
 const META_ACTIVE: &str = "token_rate_limit.active";
 const META_KEY: &str = "token_rate_limit.key";
+const META_GOVERNANCE: &str = "token_rate_limit.governance";
 const META_TOKEN_TOTAL: &str = "token.total";
 const MAX_RULES: usize = 32;
 const MAX_BUDGETS: usize = 8;
@@ -110,6 +111,16 @@ struct TokenRateLimitConfig {
     rules: Vec<RuleConfig>,
     #[serde(default)]
     backend: BackendConfig,
+    #[serde(default)]
+    enforcement: EnforcementMode,
+}
+
+#[derive(Debug, Default, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum EnforcementMode {
+    #[default]
+    Hard,
+    Soft,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -209,6 +220,8 @@ struct RuleConfig {
     estimation: EstimationConfig,
     #[serde(rename = "token_budgets", alias = "budgets")]
     token_budgets: Vec<BudgetConfig>,
+    #[serde(default)]
+    enforcement: Option<EnforcementMode>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -228,6 +241,7 @@ struct RuleRuntime {
     match_value: Option<String>,
     backend: Arc<dyn TokenRateLimitStateBackend>,
     estimate: u64,
+    soft: bool,
 }
 
 /// Token quota admission with local or shared sliding-window accounting.
@@ -253,6 +267,37 @@ pub struct TokenRateLimitFilter {
     max_key_length: usize,
     rules: Vec<RuleRuntime>,
     epoch: Instant,
+}
+
+fn inject_governance_headers(ctx: &mut HttpFilterContext<'_>, rules: &[RuleRuntime]) {
+    let Some(governance) = ctx.get_metadata(META_GOVERNANCE).map(str::to_owned) else {
+        return;
+    };
+    let Some(rule_index) = ctx
+        .get_metadata(META_RESERVATION_ID)
+        .and_then(|value| value.split_once(':'))
+        .and_then(|(rule, _)| rule.parse::<usize>().ok())
+    else {
+        return;
+    };
+    let Some(rule) = rules.get(rule_index) else {
+        return;
+    };
+    let Some(response) = ctx.response_header.as_mut() else {
+        return;
+    };
+    let Ok(governance_value) = HeaderValue::from_str(&governance) else {
+        return;
+    };
+    response
+        .headers
+        .insert(HeaderName::from_static("x-ratelimit-governance"), governance_value);
+    if let Ok(limit_value) = HeaderValue::from_str(&rule.backend.limit().to_string()) {
+        response
+            .headers
+            .insert(HeaderName::from_static("x-ratelimit-limit"), limit_value);
+    }
+    ctx.response_headers_modified = true;
 }
 
 impl TokenRateLimitFilter {
@@ -367,6 +412,7 @@ impl TokenRateLimitFilter {
                 match_value,
                 backend,
                 estimate: rule.estimation.tokens,
+                soft: matches!(rule.enforcement.unwrap_or(cfg.enforcement), EnforcementMode::Soft),
             });
         }
         Ok(Self {
@@ -556,6 +602,7 @@ impl HttpFilter for TokenRateLimitFilter {
                 key: key.clone(),
                 estimate: rule.estimate,
                 now_ms,
+                soft: rule.soft,
             })
             .await
         {
@@ -585,6 +632,32 @@ impl HttpFilter for TokenRateLimitFilter {
                 self.record_state_metrics();
                 Ok(FilterAction::Continue)
             },
+            Ok(BackendReserve::SoftAdmitted {
+                reservation_id,
+                estimate,
+                over_allocated,
+            }) => {
+                let status = if over_allocated { "over_allocation" } else { "within" };
+                counter!("praxis_ai_token_rate_limit_requests_total", "decision" => "admitted", "reason" => status)
+                    .increment(1);
+                counter!("praxis_ai_token_rate_limit_tokens_total", "kind" => "estimated").increment(estimate);
+                ctx.set_metadata(META_RESERVATION_ID, format!("{rule_index}:{reservation_id}"));
+                ctx.set_metadata(META_ACTIVE, "true");
+                ctx.set_metadata(META_KEY, &key);
+                ctx.set_metadata(META_GOVERNANCE, status);
+                if ctx.get_metadata(META_RESERVATION_ID).is_none() {
+                    drop(rule.backend.enqueue_reconcile(ReconcileRequest {
+                        key: key.clone(),
+                        reservation_id,
+                        actual: None,
+                        estimate: rule.estimate,
+                        now_ms,
+                    }));
+                    return Ok(FilterAction::Reject(Rejection::status(500)));
+                }
+                self.record_state_metrics();
+                Ok(FilterAction::Continue)
+            },
             Ok(BackendReserve::Denied { retry_after_ms }) => {
                 counter!("praxis_ai_token_rate_limit_requests_total", "decision" => "denied", "reason" => "capacity")
                     .increment(1);
@@ -606,6 +679,7 @@ impl HttpFilter for TokenRateLimitFilter {
     }
 
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        inject_governance_headers(ctx, &self.rules);
         let success = ctx
             .response_header
             .as_ref()

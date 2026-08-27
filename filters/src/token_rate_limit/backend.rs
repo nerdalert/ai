@@ -17,6 +17,7 @@ pub(crate) struct ReserveRequest {
     pub(crate) key: String,
     pub(crate) estimate: u64,
     pub(crate) now_ms: u64,
+    pub(crate) soft: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -30,8 +31,18 @@ pub(crate) struct ReconcileRequest {
 
 #[derive(Debug, Clone)]
 pub(crate) enum BackendReserve {
-    Admitted { reservation_id: u64, estimate: u64 },
-    Denied { retry_after_ms: u64 },
+    Admitted {
+        reservation_id: u64,
+        estimate: u64,
+    },
+    SoftAdmitted {
+        reservation_id: u64,
+        estimate: u64,
+        over_allocated: bool,
+    },
+    Denied {
+        retry_after_ms: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,10 +90,22 @@ impl InMemoryTokenRateLimitBackend {
 impl TokenRateLimitStateBackend for InMemoryTokenRateLimitBackend {
     async fn reserve(&self, request: ReserveRequest) -> Result<BackendReserve, BackendError> {
         Ok(
-            match self.ledger.reserve(&request.key, request.estimate, request.now_ms) {
+            match if request.soft {
+                self.ledger.reserve_soft(&request.key, request.estimate, request.now_ms)
+            } else {
+                self.ledger.reserve(&request.key, request.estimate, request.now_ms)
+            } {
                 Decision::Admitted(reservation) => BackendReserve::Admitted {
                     reservation_id: reservation.id,
                     estimate: reservation.estimate,
+                },
+                Decision::SoftAdmitted {
+                    reservation,
+                    over_allocated,
+                } => BackendReserve::SoftAdmitted {
+                    reservation_id: reservation.id,
+                    estimate: reservation.estimate,
+                    over_allocated,
                 },
                 Decision::Denied { retry_after_ms, .. } => BackendReserve::Denied { retry_after_ms },
             },
@@ -139,6 +162,7 @@ local settled_index = KEYS[8]
 local active_tokens_key = KEYS[9]
 local bucket_ms = tonumber(ARGV[6 + (budget_count * 2)])
 local max_buckets = tonumber(ARGV[7 + (budget_count * 2)])
+local soft = tonumber(ARGV[8 + (budget_count * 2)]) == 1
 
 local active_total = tonumber(redis.call('GET', KEYS[5]) or '0')
 local expired_global = redis.call('ZRANGE', KEYS[7], '-inf', now_ms, 'BYSCORE')
@@ -200,7 +224,7 @@ for i = 1, budget_count do
     settled_sum = settled_sum + tonumber(redis.call('HGET', settled, buckets[j]) or '0')
   end
   local active_sum = tonumber(redis.call('GET', active_tokens_key) or '0')
-  if settled_sum + active_sum + estimate > capacity then
+  if not soft and settled_sum + active_sum + estimate > capacity then
     return {0, max_window}
   end
 end
@@ -217,7 +241,19 @@ redis.call('PEXPIRE', active, ttl)
 redis.call('PEXPIRE', settled_index, ttl)
 redis.call('PEXPIRE', active_tokens_key, ttl)
 redis.call('PEXPIRE', KEYS[1], ttl)
-return {1, id, estimate}
+local over_allocated = 0
+for i = 1, budget_count do
+  local window = tonumber(ARGV[5 + (i * 2) - 1])
+  local capacity = tonumber(ARGV[5 + (i * 2)])
+  local settled_sum = 0
+  local buckets = redis.call('ZRANGEBYSCORE', settled_index, now_ms - window, '+inf')
+  for j = 1, #buckets do
+    settled_sum = settled_sum + tonumber(redis.call('HGET', settled, buckets[j]) or '0')
+  end
+  local active_sum = tonumber(redis.call('GET', active_tokens_key) or '0')
+  if settled_sum + active_sum > capacity then over_allocated = 1 end
+end
+return {soft and 2 or 1, id, estimate, over_allocated}
 ";
 
 const RECONCILE_SCRIPT: &str = "
@@ -409,6 +445,7 @@ impl TokenRateLimitStateBackend for ValkeyTokenRateLimitBackend {
         }
         args.push("1000".into());
         args.push("4096".into());
+        args.push(if request.soft { "1" } else { "0" }.into());
         let mut invocation = RESERVE_LUA.key(&keys[0]);
         for key in keys.iter().skip(1) {
             invocation.key(key);
@@ -423,9 +460,14 @@ impl TokenRateLimitStateBackend for ValkeyTokenRateLimitBackend {
                 .map_err(|_error| BackendError::Unavailable("Valkey reservation timed out".into()))?
                 .map_err(|e| BackendError::Unavailable(e.to_string()))?;
         match response.as_slice() {
-            [1, id, estimate] => Ok(BackendReserve::Admitted {
+            [1, id, estimate, ..] => Ok(BackendReserve::Admitted {
                 reservation_id: u64::try_from(*id).map_err(|_error| BackendError::InvalidResponse)?,
                 estimate: u64::try_from(*estimate).map_err(|_error| BackendError::InvalidResponse)?,
+            }),
+            [2, id, estimate, over_allocated] => Ok(BackendReserve::SoftAdmitted {
+                reservation_id: u64::try_from(*id).map_err(|_error| BackendError::InvalidResponse)?,
+                estimate: u64::try_from(*estimate).map_err(|_error| BackendError::InvalidResponse)?,
+                over_allocated: *over_allocated != 0,
             }),
             [0, retry_after] => Ok(BackendReserve::Denied {
                 retry_after_ms: u64::try_from(*retry_after).map_err(|_error| BackendError::InvalidResponse)?,
