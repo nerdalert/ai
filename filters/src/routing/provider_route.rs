@@ -275,6 +275,15 @@ impl HttpFilter for ProviderRouteFilter {
         set_credential_metadata(ctx, route.credential.as_ref());
         set_provider_headers(ctx, &self.provider_id_header, &request_id, overlay_revision.as_deref())?;
 
+        #[cfg(feature = "opentelemetry")]
+        crate::opentelemetry::record_provider_route_selection(
+            &self.provider_id,
+            &route.cluster,
+            &route.model,
+            &candidate_id,
+            overlay_revision.as_deref(),
+        );
+
         Ok(FilterAction::Continue)
     }
 
@@ -820,6 +829,54 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[tokio::test]
+    async fn distinct_candidates_resolve_independent_cluster_metadata() {
+        let f = ProviderRouteFilter::from_config(&two_route_config()).unwrap();
+        let req_a = request_with_peer_context("/v1/chat/completions", "abc123", "req-1", "sim-model-v1");
+        let req_b = request_with_peer_context("/v1/chat/completions", "def456", "req-2", "sim-model-v1");
+        let mut ctx_a = test_utils::make_filter_context(&req_a);
+        let mut ctx_b = test_utils::make_filter_context(&req_b);
+
+        let (action_a, action_b) = tokio::join!(f.on_request(&mut ctx_a), f.on_request(&mut ctx_b));
+
+        assert!(matches!(action_a.unwrap(), FilterAction::Continue));
+        assert!(matches!(action_b.unwrap(), FilterAction::Continue));
+        assert_eq!(ctx_a.get_metadata(PROVIDER_ROUTE_CLUSTER), Some("mock-backend"));
+        assert_eq!(ctx_b.get_metadata(PROVIDER_ROUTE_CLUSTER), Some("other-backend"));
+        assert_ne!(
+            ctx_a.get_metadata(PROVIDER_ROUTE_CLUSTER),
+            ctx_b.get_metadata(PROVIDER_ROUTE_CLUSTER),
+            "independent requests against the same filter instance must not leak cluster metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_id_metadata_is_stable_and_distinct_from_cluster() {
+        let f = ProviderRouteFilter::from_config(&two_route_config()).unwrap();
+
+        for (candidate_id, request_id, expected_cluster) in [
+            ("abc123", "req-1", "mock-backend"),
+            ("def456", "req-2", "other-backend"),
+        ] {
+            let req = request_with_peer_context("/v1/chat/completions", candidate_id, request_id, "sim-model-v1");
+            let mut ctx = test_utils::make_filter_context(&req);
+            let action = f.on_request(&mut ctx).await.unwrap();
+            assert!(matches!(action, FilterAction::Continue));
+            assert_eq!(ctx.get_metadata(PROVIDER_ROUTE_PROVIDER_ID), Some("test-provider"));
+            assert_eq!(ctx.get_metadata(PROVIDER_ROUTE_CLUSTER), Some(expected_cluster));
+            assert_ne!(
+                ctx.get_metadata(PROVIDER_ROUTE_PROVIDER_ID),
+                ctx.get_metadata(PROVIDER_ROUTE_CLUSTER),
+                "provider_id must remain distinct from the resolved backend cluster"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Provider Attribution
+    // -------------------------------------------------------------------------
+>>>>>>> 44f53741 (feat(observability): trace provider backend routes)
+
+    #[tokio::test]
     async fn sets_provider_attribution_request_header() {
         let f = make_filter("abc123");
         let req = request_with_peer_context("/v1/chat/completions", "abc123", "req-1", "sim-model-v1");
@@ -1097,6 +1154,24 @@ mod tests {
         config["overlay_revision"] =
             serde_yaml::Value::from("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         ProviderRouteFilter::from_config(&config).unwrap()
+    }
+
+    /// Config with two candidates mapped to distinct backend clusters, for
+    /// isolation and attribution tests across independent requests.
+    fn two_route_config() -> serde_yaml::Value {
+        serde_yaml::from_str(
+            "provider_id: test-provider\n\
+             routes:\n\
+             \x20 - candidate_id: abc123\n\
+             \x20   cluster: mock-backend\n\
+             \x20   model: sim-model-v1\n\
+             \x20   paths: [/v1/chat/completions]\n\
+             \x20 - candidate_id: def456\n\
+             \x20   cluster: other-backend\n\
+             \x20   model: sim-model-v1\n\
+             \x20   paths: [/v1/chat/completions]\n",
+        )
+        .unwrap()
     }
 
     fn credential_provider_config() -> serde_yaml::Value {
