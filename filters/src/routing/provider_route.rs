@@ -874,7 +874,6 @@ mod tests {
     // -------------------------------------------------------------------------
     // Provider Attribution
     // -------------------------------------------------------------------------
->>>>>>> 44f53741 (feat(observability): trace provider backend routes)
 
     #[tokio::test]
     async fn sets_provider_attribution_request_header() {
