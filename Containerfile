@@ -57,11 +57,15 @@ RUN mkdir -p apis/src filters/src server/src integrations/llmd/ext-proc/src \
     && printf '//! stub\nfn main() {}\n' > server/src/main.rs
 
 ARG ENABLE_OPENTELEMETRY=false
+ARG ENABLE_AZURE_AD=false
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    if [ "$ENABLE_OPENTELEMETRY" = "true" ]; then \
-      cargo build --release -p praxis-ai-proxy --features opentelemetry; \
+    features=""; \
+    if [ "$ENABLE_OPENTELEMETRY" = "true" ]; then features="opentelemetry"; fi; \
+    if [ "$ENABLE_AZURE_AD" = "true" ]; then features="${features:+$features,}azure-ad-filter"; fi; \
+    if [ -n "$features" ]; then \
+      cargo build --release -p praxis-ai-proxy --features "$features"; \
     else \
       cargo build --release -p praxis-ai-proxy; \
     fi
@@ -88,8 +92,11 @@ RUN find apis/src filters/src server/src integrations/llmd/ext-proc/src \
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    if [ "$ENABLE_OPENTELEMETRY" = "true" ]; then \
-      cargo build --release -p praxis-ai-proxy --features opentelemetry; \
+    features=""; \
+    if [ "$ENABLE_OPENTELEMETRY" = "true" ]; then features="opentelemetry"; fi; \
+    if [ "$ENABLE_AZURE_AD" = "true" ]; then features="${features:+$features,}azure-ad-filter"; fi; \
+    if [ -n "$features" ]; then \
+      cargo build --release -p praxis-ai-proxy --features "$features"; \
     else \
       cargo build --release -p praxis-ai-proxy; \
     fi \

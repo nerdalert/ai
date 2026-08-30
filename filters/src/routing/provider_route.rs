@@ -25,11 +25,10 @@ use super::{
     descriptor,
     metadata::{
         CandidateCredential, OVERLAY_REVISION_HEADER, PROVIDER_ATTRIBUTION_HEADER,
-        PROVIDER_ATTRIBUTION_RESPONSE_HEADER, PROVIDER_HOP_REQUEST_ID_HEADER, PROVIDER_OVERLAY_REVISION_HEADER,
-        PROVIDER_REQUEST_ID_HEADER, PROVIDER_ROUTE_CANDIDATE_ID, PROVIDER_ROUTE_CLUSTER, PROVIDER_ROUTE_MODEL,
-        PROVIDER_ROUTE_OVERLAY_REVISION, PROVIDER_ROUTE_PROVIDER_ID, PROVIDER_ROUTE_PROVIDER_MODEL,
-        PROVIDER_ROUTE_REQUEST_ID,
-        SELECTED_CANDIDATE_HEADER, set_credential_metadata,
+        PROVIDER_ATTRIBUTION_RESPONSE_HEADER, PROVIDER_HOP_REQUEST_ID_HEADER, PROVIDER_INFERENCE_RESPONSE_HEADER,
+        PROVIDER_OVERLAY_REVISION_HEADER, PROVIDER_REQUEST_ID_HEADER, PROVIDER_ROUTE_CANDIDATE_ID,
+        PROVIDER_ROUTE_CLUSTER, PROVIDER_ROUTE_MODEL, PROVIDER_ROUTE_OVERLAY_REVISION, PROVIDER_ROUTE_PROVIDER_ID,
+        PROVIDER_ROUTE_PROVIDER_MODEL, PROVIDER_ROUTE_REQUEST_ID, SELECTED_CANDIDATE_HEADER, set_credential_metadata,
     },
 };
 
@@ -182,6 +181,10 @@ impl ProviderRouteFilter {
         let mut routes = HashMap::with_capacity(cfg.routes.len());
         for route in cfg.routes {
             validate_route(&route)?;
+            if cfg.emit_demo_attribution {
+                HeaderValue::from_str(&route.cluster)
+                    .map_err(|_| FilterError::from("provider_route: cluster must be a valid HTTP header value"))?;
+            }
             let candidate_id: Arc<str> = Arc::from(route.candidate_id.as_str());
             let provider_route = ProviderRoute {
                 cluster: Arc::from(route.cluster.as_str()),
@@ -291,6 +294,11 @@ impl HttpFilter for ProviderRouteFilter {
         if !self.emit_demo_attribution {
             return Ok(FilterAction::Continue);
         }
+        let inference_provider = ctx
+            .get_metadata(PROVIDER_ROUTE_CLUSTER)
+            .map(HeaderValue::from_str)
+            .transpose()
+            .map_err(|error| FilterError::from(format!("provider_route: invalid provider cluster header: {error}")))?;
         let Some(response) = ctx.response_header.as_mut() else {
             return Ok(FilterAction::Continue);
         };
@@ -298,6 +306,12 @@ impl HttpFilter for ProviderRouteFilter {
             HeaderName::from_static(PROVIDER_ATTRIBUTION_RESPONSE_HEADER),
             self.provider_id_header.clone(),
         );
+        if let Some(inference_provider) = inference_provider {
+            response.headers.insert(
+                HeaderName::from_static(PROVIDER_INFERENCE_RESPONSE_HEADER),
+                inference_provider,
+            );
+        }
         ctx.response_headers_modified = true;
         Ok(FilterAction::Continue)
     }
@@ -892,7 +906,11 @@ mod tests {
     #[tokio::test]
     async fn emits_demo_attribution_response_header() {
         let f = make_filter("abc123");
-        let req = request_with_peer_context("/v1/chat/completions", "abc123", "req-1", "sim-model-v1");
+        let mut req = request_with_peer_context("/v1/chat/completions", "abc123", "req-1", "sim-model-v1");
+        req.headers.insert(
+            HeaderName::from_static(PROVIDER_INFERENCE_RESPONSE_HEADER),
+            HeaderValue::from_static("client-supplied-value"),
+        );
         let mut ctx = test_utils::make_filter_context(&req);
         let _action = f.on_request(&mut ctx).await.unwrap();
         let mut resp = test_utils::make_response();
@@ -905,10 +923,17 @@ mod tests {
             Some("test-provider"),
             "demo attribution response header"
         );
+        assert_eq!(
+            resp.headers
+                .get(PROVIDER_INFERENCE_RESPONSE_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("mock-backend"),
+            "selected provider backend response header"
+        );
     }
 
     #[tokio::test]
-    async fn omits_demo_attribution_response_header_by_default() {
+    async fn omits_response_attribution_by_default() {
         let config = provider_config_with_demo_attribution(
             "abc123",
             "sim-model-v1",
@@ -928,6 +953,7 @@ mod tests {
         assert!(matches!(action, FilterAction::Continue));
         assert!(!ctx.response_headers_modified);
         assert!(resp.headers.get(PROVIDER_ATTRIBUTION_RESPONSE_HEADER).is_none());
+        assert!(resp.headers.get(PROVIDER_INFERENCE_RESPONSE_HEADER).is_none());
     }
 
     // -------------------------------------------------------------------------
@@ -1040,6 +1066,19 @@ mod tests {
             .err()
             .expect("invalid header value must fail construction");
         assert!(error.to_string().contains("invalid provider_id header"), "{error}");
+    }
+
+    #[test]
+    fn invalid_cluster_header_rejected_at_construction() {
+        let yaml = "provider_id: p\nemit_demo_attribution: true\nroutes:\n  - candidate_id: a\n    model: m\n    paths: [/x]\n    cluster: \"bad\\0value\"\n";
+        let val: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let error = ProviderRouteFilter::from_config(&val)
+            .err()
+            .expect("invalid cluster header value must fail construction");
+        assert!(
+            error.to_string().contains("cluster must be a valid HTTP header value"),
+            "{error}"
+        );
     }
 
     #[test]

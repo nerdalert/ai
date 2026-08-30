@@ -30,8 +30,11 @@ pub(crate) const PROVIDER_REQUEST_ID_HEADER: &str = "x-ai-provider-request-id";
 /// Provider-owned copy of the serving overlay revision for backend telemetry.
 pub(crate) const PROVIDER_OVERLAY_REVISION_HEADER: &str = "x-ai-provider-routing-revision";
 
-/// Demo-only response attribution header.
+/// Optional provider-gateway response attribution header.
 pub(crate) const PROVIDER_ATTRIBUTION_RESPONSE_HEADER: &str = "x-ai-demo-provider-gateway";
+
+/// Provider-local inference backend selected by `provider_route`.
+pub(crate) const PROVIDER_INFERENCE_RESPONSE_HEADER: &str = "x-ai-inference-provider";
 
 /// Admission state of the selected route candidate.
 pub(crate) const ROUTE_ADMISSION_STATE: &str = "intelligent_route.admission_state";
