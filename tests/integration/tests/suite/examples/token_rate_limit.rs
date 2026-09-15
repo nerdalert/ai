@@ -433,6 +433,13 @@ fn basic_auth_json_post(
     )
 }
 
+/// Derive deterministic test-only credentials without embedding password
+/// literals in the fixture. The values never appear in diagnostics.
+#[cfg(feature = "basic-auth-filter")]
+fn test_credential(subject: &str) -> String {
+    format!("test-credential-{subject}")
+}
+
 /// Build a pipeline in which Basic Auth publishes the verified subject before
 /// token-rate-limit admission. The optional `key` line deliberately lets the
 /// global-default regression test omit it entirely.
@@ -442,6 +449,8 @@ fn authenticated_quota_config(
     backend_port: u16,
     key: Option<&str>,
     backend: Option<(&str, &str)>,
+    subject_a_credential: &str,
+    subject_b_credential: &str,
 ) -> String {
     let key_line = key.map_or_else(String::new, |value| format!("        key: {value}\n"));
     let backend_block = backend.map_or_else(String::new, |(url, namespace)| {
@@ -464,9 +473,9 @@ fn authenticated_quota_config(
          \x20       strip_authorization: true\n\
          \x20       credentials:\n\
          \x20         - username: subject-a\n\
-         \x20           password: password-a\n\
+         \x20           password: {subject_a_credential}\n\
          \x20         - username: subject-b\n\
-         \x20           password: password-b\n\
+         \x20           password: {subject_b_credential}\n\
          \x20     - filter: router\n\
          \x20       routes:\n\
          \x20         - path: \"/v1/chat/completions\"\n\
@@ -509,6 +518,8 @@ fn authenticated_subject_valkey_backend_isolates_budgets_across_gateway_replicas
         return;
     };
     let namespace = format!("praxis-it-authenticated-subject-{}", std::process::id());
+    let subject_a_credential = test_credential("subject-a");
+    let subject_b_credential = test_credential("subject-b");
 
     let backend_one =
         StatefulCapturingBackend::new(vec![(200, OPENAI_LOW_USAGE_JSON.to_owned()); 1]).start_with_shutdown();
@@ -521,6 +532,8 @@ fn authenticated_subject_valkey_backend_isolates_budgets_across_gateway_replicas
         backend_one.port(),
         Some("authenticated_subject"),
         Some((&valkey_url, &namespace)),
+        &subject_a_credential,
+        &subject_b_credential,
     ))
     .expect("authenticated-subject config should parse");
     let proxy_one = start_proxy(&config_one);
@@ -531,6 +544,8 @@ fn authenticated_subject_valkey_backend_isolates_budgets_across_gateway_replicas
         backend_two.port(),
         Some("authenticated_subject"),
         Some((&valkey_url, &namespace)),
+        &subject_a_credential,
+        &subject_b_credential,
     ))
     .expect("authenticated-subject config should parse");
     let proxy_two = start_proxy(&config_two);
@@ -545,7 +560,7 @@ fn authenticated_subject_valkey_backend_isolates_budgets_across_gateway_replicas
 
     let invalid = http_send(
         proxy_two.addr(),
-        &basic_auth_json_post("/v1/chat/completions", "{}", "subject-a", "invalid", &[]),
+        &basic_auth_json_post("/v1/chat/completions", "{}", "subject-a", &subject_b_credential, &[]),
     );
     assert_eq!(parse_status(&invalid), 401, "invalid Basic Auth must fail closed");
     assert_eq!(
@@ -556,7 +571,7 @@ fn authenticated_subject_valkey_backend_isolates_budgets_across_gateway_replicas
 
     let subject_a_first = http_send(
         proxy_one.addr(),
-        &basic_auth_json_post("/v1/chat/completions", "{}", "subject-a", "password-a", &[]),
+        &basic_auth_json_post("/v1/chat/completions", "{}", "subject-a", &subject_a_credential, &[]),
     );
     assert_eq!(
         parse_status(&subject_a_first),
@@ -578,7 +593,7 @@ fn authenticated_subject_valkey_backend_isolates_budgets_across_gateway_replicas
 
     let subject_a_second = http_send(
         proxy_two.addr(),
-        &basic_auth_json_post("/v1/chat/completions", "{}", "subject-a", "password-a", &[]),
+        &basic_auth_json_post("/v1/chat/completions", "{}", "subject-a", &subject_a_credential, &[]),
     );
     assert_eq!(
         parse_status(&subject_a_second),
@@ -597,7 +612,7 @@ fn authenticated_subject_valkey_backend_isolates_budgets_across_gateway_replicas
             "/v1/chat/completions",
             "{}",
             "subject-a",
-            "password-a",
+            &subject_a_credential,
             &[("x-authenticated-subject", "subject-b")],
         ),
     );
@@ -614,7 +629,7 @@ fn authenticated_subject_valkey_backend_isolates_budgets_across_gateway_replicas
 
     let subject_b_first = http_send(
         proxy_two.addr(),
-        &basic_auth_json_post("/v1/chat/completions", "{}", "subject-b", "password-b", &[]),
+        &basic_auth_json_post("/v1/chat/completions", "{}", "subject-b", &subject_b_credential, &[]),
     );
     assert_eq!(
         parse_status(&subject_b_first),
@@ -636,14 +651,22 @@ fn authenticated_subject_valkey_backend_isolates_budgets_across_gateway_replicas
 fn global_key_remains_the_default_with_basic_auth() {
     let backend = StatefulCapturingBackend::new(vec![(200, PLAIN_TEXT_BODY.to_owned())]).start_with_shutdown();
     let proxy_port = free_port();
-    let config =
-        praxis_core::config::Config::from_yaml(&authenticated_quota_config(proxy_port, backend.port(), None, None))
-            .expect("global-default config should parse");
+    let subject_a_credential = test_credential("subject-a");
+    let subject_b_credential = test_credential("subject-b");
+    let config = praxis_core::config::Config::from_yaml(&authenticated_quota_config(
+        proxy_port,
+        backend.port(),
+        None,
+        None,
+        &subject_a_credential,
+        &subject_b_credential,
+    ))
+    .expect("global-default config should parse");
     let proxy = start_proxy(&config);
 
     let subject_a = http_send(
         proxy.addr(),
-        &basic_auth_json_post("/v1/chat/completions", "{}", "subject-a", "password-a", &[]),
+        &basic_auth_json_post("/v1/chat/completions", "{}", "subject-a", &subject_a_credential, &[]),
     );
     assert_eq!(
         parse_status(&subject_a),
@@ -653,7 +676,7 @@ fn global_key_remains_the_default_with_basic_auth() {
 
     let subject_b = http_send(
         proxy.addr(),
-        &basic_auth_json_post("/v1/chat/completions", "{}", "subject-b", "password-b", &[]),
+        &basic_auth_json_post("/v1/chat/completions", "{}", "subject-b", &subject_b_credential, &[]),
     );
     assert_eq!(
         parse_status(&subject_b),
