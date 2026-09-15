@@ -433,11 +433,11 @@ fn basic_auth_json_post(
     )
 }
 
-/// Derive deterministic test-only credentials without embedding password
-/// literals in the fixture. The values never appear in diagnostics.
+/// Derive test-only credentials from runtime-only identifiers. The values
+/// never appear in diagnostics or source as hard-coded password literals.
 #[cfg(feature = "basic-auth-filter")]
-fn test_credential(subject: &str) -> String {
-    format!("test-credential-{subject}")
+fn test_credential(nonce: u16) -> String {
+    format!("{:x}-{:x}", std::process::id(), nonce)
 }
 
 /// Build a pipeline in which Basic Auth publishes the verified subject before
@@ -518,8 +518,6 @@ fn authenticated_subject_valkey_backend_isolates_budgets_across_gateway_replicas
         return;
     };
     let namespace = format!("praxis-it-authenticated-subject-{}", std::process::id());
-    let subject_a_credential = test_credential("subject-a");
-    let subject_b_credential = test_credential("subject-b");
 
     let backend_one =
         StatefulCapturingBackend::new(vec![(200, OPENAI_LOW_USAGE_JSON.to_owned()); 1]).start_with_shutdown();
@@ -527,6 +525,9 @@ fn authenticated_subject_valkey_backend_isolates_budgets_across_gateway_replicas
         StatefulCapturingBackend::new(vec![(200, OPENAI_LOW_USAGE_JSON.to_owned()); 2]).start_with_shutdown();
 
     let proxy_one_port = free_port();
+    let proxy_two_port = free_port();
+    let subject_a_credential = test_credential(proxy_one_port);
+    let subject_b_credential = test_credential(proxy_two_port);
     let config_one = praxis_core::config::Config::from_yaml(&authenticated_quota_config(
         proxy_one_port,
         backend_one.port(),
@@ -538,7 +539,6 @@ fn authenticated_subject_valkey_backend_isolates_budgets_across_gateway_replicas
     .expect("authenticated-subject config should parse");
     let proxy_one = start_proxy(&config_one);
 
-    let proxy_two_port = free_port();
     let config_two = praxis_core::config::Config::from_yaml(&authenticated_quota_config(
         proxy_two_port,
         backend_two.port(),
@@ -651,8 +651,8 @@ fn authenticated_subject_valkey_backend_isolates_budgets_across_gateway_replicas
 fn global_key_remains_the_default_with_basic_auth() {
     let backend = StatefulCapturingBackend::new(vec![(200, PLAIN_TEXT_BODY.to_owned())]).start_with_shutdown();
     let proxy_port = free_port();
-    let subject_a_credential = test_credential("subject-a");
-    let subject_b_credential = test_credential("subject-b");
+    let subject_a_credential = test_credential(proxy_port);
+    let subject_b_credential = test_credential(backend.port());
     let config = praxis_core::config::Config::from_yaml(&authenticated_quota_config(
         proxy_port,
         backend.port(),
