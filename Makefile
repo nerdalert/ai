@@ -105,8 +105,8 @@ test-token-rate-limit-valkey-unit:
 	cargo test -p praxis-ai-filters --features token-rate-limit-filter valkey $(_NOCAPTURE)
 
 test-token-rate-limit-valkey-integration:
-	cargo test -p praxis-tests-integration --features token-rate-limit-filter --test suite \
-		mixed_algorithm_rules_valkey_backend_isolates_budgets_across_gateway_replicas $(_NOCAPTURE)
+	cargo test -p praxis-tests-integration --features basic-auth-filter,token-rate-limit-filter --test suite \
+		token_rate_limit $(_NOCAPTURE)
 
 openai-conformance:
 	cargo xtask openai-conformance $(OPENAI_CONFORMANCE_ARGS)
