@@ -111,8 +111,8 @@ use self::{
         ValkeyTokenRateLimitBackend,
     },
     config::{
-        BackendConfig, BackendKind, DEFAULT_RESERVATION_TIMEOUT, EstimationConfig, EstimationStrategy, MatchConfig,
-        KeySource, RuleAlgorithm, RuleConfig, TokenRateLimitConfig,
+        BackendConfig, BackendKind, DEFAULT_RESERVATION_TIMEOUT, EstimationConfig, EstimationStrategy, KeySource,
+        MatchConfig, RuleAlgorithm, RuleConfig, TokenRateLimitConfig,
     },
     ledger::{Budget, Ledger, LedgerConfig},
     token_bucket_ledger::{TokenBucketConfig, TokenBucketLedger},
@@ -958,6 +958,25 @@ impl TokenRateLimitFilter {
         }
     }
 
+    /// Resolve the trusted quota key and record a fail-closed identity miss.
+    fn resolve_key_or_record_rejection(&self, ctx: &HttpFilterContext<'_>, rule: &CompiledRule) -> Option<String> {
+        let key = self.resolve_key(ctx);
+        if key.is_none() {
+            tracing::info!(
+                rule = rule.name,
+                "token_rate_limit: rejecting request (401), no authenticated subject"
+            );
+            counter!(
+                "praxis_ai_token_rate_limit_requests_total",
+                "decision" => "denied",
+                "reason" => "missing_authenticated_subject",
+                "rule" => rule.name.clone(),
+            )
+            .increment(1);
+        }
+        key
+    }
+
     /// Reclaim idle/orphaned in-process state for one rule and publish
     /// its gauges.
     ///
@@ -1212,18 +1231,7 @@ impl HttpFilter for TokenRateLimitFilter {
         let Some(estimate) = estimate else {
             return Ok(FilterAction::Continue);
         };
-        let Some(key) = self.resolve_key(ctx) else {
-            tracing::info!(
-                rule = rule.name,
-                "token_rate_limit: rejecting request (401), no authenticated subject"
-            );
-            counter!(
-                "praxis_ai_token_rate_limit_requests_total",
-                "decision" => "denied",
-                "reason" => "missing_authenticated_subject",
-                "rule" => rule.name.clone(),
-            )
-            .increment(1);
+        let Some(key) = self.resolve_key_or_record_rejection(ctx, rule) else {
             return Ok(FilterAction::Reject(Rejection::status(401)));
         };
         let outcome = rule
@@ -1256,27 +1264,14 @@ impl HttpFilter for TokenRateLimitFilter {
         };
         Self::cleanup_and_record_state(rule, now_ms);
 
-        let body_probe = body
-            .as_ref()
-            .and_then(|raw| serde_json::from_slice::<BodyProbe>(raw).ok());
+        let body_probe = parse_body_probe(body);
         let estimate = rule.estimation.estimate(&ctx.request.headers, body_probe.as_ref());
 
         let Some(estimate) = estimate else {
             return Ok(FilterAction::Continue);
         };
 
-        let Some(key) = self.resolve_key(ctx) else {
-            tracing::info!(
-                rule = rule.name,
-                "token_rate_limit: rejecting request (401), no authenticated subject"
-            );
-            counter!(
-                "praxis_ai_token_rate_limit_requests_total",
-                "decision" => "denied",
-                "reason" => "missing_authenticated_subject",
-                "rule" => rule.name.clone(),
-            )
-            .increment(1);
+        let Some(key) = self.resolve_key_or_record_rejection(ctx, rule) else {
             return Ok(FilterAction::Reject(Rejection::status(401)));
         };
         let outcome = rule
@@ -1315,6 +1310,11 @@ impl HttpFilter for TokenRateLimitFilter {
 fn subject_bucket_key(subject: &str) -> String {
     let digest = Sha256::digest(subject.as_bytes());
     format!("subject:v1:{}", URL_SAFE_NO_PAD.encode(digest))
+}
+
+/// Parse the bounded request body fields used by estimation strategies.
+fn parse_body_probe(body: &Option<Bytes>) -> Option<BodyProbe> {
+    body.as_ref().and_then(|raw| serde_json::from_slice(raw).ok())
 }
 
 /// Expand one `${ENV_VAR}` reference in a backend URL, if present.

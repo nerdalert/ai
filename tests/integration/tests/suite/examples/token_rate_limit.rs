@@ -449,9 +449,9 @@ fn authenticated_quota_config(
     backend_port: u16,
     key: Option<&str>,
     backend: Option<(&str, &str)>,
-    subject_a_credential: &str,
-    subject_b_credential: &str,
+    subject_credentials: (&str, &str),
 ) -> String {
+    let (subject_a_credential, subject_b_credential) = subject_credentials;
     let key_line = key.map_or_else(String::new, |value| format!("        key: {value}\n"));
     let backend_block = backend.map_or_else(String::new, |(url, namespace)| {
         format!(
@@ -476,10 +476,6 @@ fn authenticated_quota_config(
          \x20           password: {subject_a_credential}\n\
          \x20         - username: subject-b\n\
          \x20           password: {subject_b_credential}\n\
-         \x20     - filter: router\n\
-         \x20       routes:\n\
-         \x20         - path: \"/v1/chat/completions\"\n\
-         \x20           cluster: backend\n\
          \x20     - filter: token_rate_limit\n\
          {key_line}{backend_block}\
          \x20       rules:\n\
@@ -488,6 +484,10 @@ fn authenticated_quota_config(
          \x20           window: 1h\n\
          \x20           capacity: 30\n\
          \x20           reserved_tokens: 20\n\
+         \x20     - filter: router\n\
+         \x20       routes:\n\
+         \x20         - path: \"/v1/chat/completions\"\n\
+         \x20           cluster: backend\n\
          \x20     - filter: token_count\n\
          \x20       provider: openai\n\
          \x20     - filter: access_log\n\
@@ -533,8 +533,7 @@ fn authenticated_subject_valkey_backend_isolates_budgets_across_gateway_replicas
         backend_one.port(),
         Some("authenticated_subject"),
         Some((&valkey_url, &namespace)),
-        &subject_a_credential,
-        &subject_b_credential,
+        (&subject_a_credential, &subject_b_credential),
     ))
     .expect("authenticated-subject config should parse");
     let proxy_one = start_proxy(&config_one);
@@ -544,8 +543,7 @@ fn authenticated_subject_valkey_backend_isolates_budgets_across_gateway_replicas
         backend_two.port(),
         Some("authenticated_subject"),
         Some((&valkey_url, &namespace)),
-        &subject_a_credential,
-        &subject_b_credential,
+        (&subject_a_credential, &subject_b_credential),
     ))
     .expect("authenticated-subject config should parse");
     let proxy_two = start_proxy(&config_two);
@@ -591,10 +589,16 @@ fn authenticated_subject_valkey_backend_isolates_budgets_across_gateway_replicas
         "Basic Auth must be stripped before provider contact"
     );
 
-    let subject_a_second = http_send(
-        proxy_two.addr(),
-        &basic_auth_json_post("/v1/chat/completions", "{}", "subject-a", &subject_a_credential, &[]),
-    );
+    let subject_a_second_request =
+        basic_auth_json_post("/v1/chat/completions", "{}", "subject-a", &subject_a_credential, &[]);
+    let mut subject_a_second = String::new();
+    for _ in 0..40 {
+        subject_a_second = http_send(proxy_two.addr(), &subject_a_second_request);
+        if parse_status(&subject_a_second) == 200 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
     assert_eq!(
         parse_status(&subject_a_second),
         200,
@@ -658,8 +662,7 @@ fn global_key_remains_the_default_with_basic_auth() {
         backend.port(),
         None,
         None,
-        &subject_a_credential,
-        &subject_b_credential,
+        (&subject_a_credential, &subject_b_credential),
     ))
     .expect("global-default config should parse");
     let proxy = start_proxy(&config);
