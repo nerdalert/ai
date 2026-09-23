@@ -265,7 +265,7 @@ pub(crate) fn default_stable_id(kind: CapabilityKind, name: &str, site: &str, cl
 /// # Errors
 ///
 /// Returns [`FilterError`] if:
-/// - the candidate list is empty or exceeds [`MAX_CANDIDATES`]
+/// - the candidate list exceeds [`MAX_CANDIDATES`]
 /// - any name/site/cluster field is blank or oversized
 /// - duplicate (kind, name, site, cluster) tuples exist
 #[expect(
@@ -273,9 +273,6 @@ pub(crate) fn default_stable_id(kind: CapabilityKind, name: &str, site: &str, cl
     reason = "single validation loop, splitting hurts readability"
 )]
 pub(crate) fn validate_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<RouteCandidate>, FilterError> {
-    if raw.is_empty() {
-        return Err("routing: candidates list must not be empty".into());
-    }
     if raw.len() > MAX_CANDIDATES {
         return Err(format!("routing: candidates exceeds maximum of {MAX_CANDIDATES}").into());
     }
@@ -434,13 +431,13 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // Rejections
+    // Invalid candidate fields
     // -------------------------------------------------------------------------
 
     #[test]
-    fn empty_candidates_rejected() {
-        let err = validate_candidates(vec![]).expect_err("should fail");
-        assert!(err.to_string().contains("must not be empty"), "{err}");
+    fn empty_candidates_are_valid_fail_closed_state() {
+        let candidates = validate_candidates(vec![]).expect("empty route set is fail-closed");
+        assert!(candidates.is_empty());
     }
 
     #[test]

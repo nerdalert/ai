@@ -1227,12 +1227,9 @@ mod tests {
     }
 
     #[test]
-    fn missing_candidates_rejected() {
-        let err = parse_err("local_site: site-a\ncandidates: []\n");
-        assert!(
-            err.to_string().contains("empty"),
-            "empty candidates should be rejected: {err}"
-        );
+    fn empty_candidates_are_fail_closed() {
+        let result = parse("local_site: site-a\ncandidates: []\n");
+        assert!(result.is_ok(), "an empty serving overlay is a valid fail-closed state");
     }
 
     #[test]

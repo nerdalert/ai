@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use http::HeaderName;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, builtins::JsonBodyFieldFilter,
-    parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, FilterResultSet, HttpFilter, HttpFilterContext,
+    PendingHeaderResult, builtins::JsonBodyFieldFilter, parse_filter_config,
 };
 use serde::Deserialize;
 
@@ -165,7 +165,15 @@ impl HttpFilter for ModelToHeaderFilter {
                 "model_to_header: dropping client-supplied promotion header (anti-spoofing)"
             );
         }
-        self.inner.on_request_body(ctx, body, end_of_stream).await
+        let action = self.inner.on_request_body(ctx, body, end_of_stream).await?;
+        if matches!(action, FilterAction::BodyDone | FilterAction::Continue)
+            && let Ok(PendingHeaderResult::Value(model)) = ctx.pending_header_value(&self.header)
+        {
+            let mut result = FilterResultSet::new();
+            result.set("model", model)?;
+            ctx.filter_results.insert("model_to_header", result);
+        }
+        Ok(action)
     }
 
     fn on_response_body(

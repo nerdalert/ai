@@ -1437,7 +1437,7 @@ mod tests {
             "candidates": []
         }"#;
         let result = RouteSnapshot::from_overlay(json.as_bytes());
-        assert!(result.is_err(), "empty candidates should be rejected");
+        assert!(result.is_ok(), "an empty serving overlay is a valid fail-closed state");
     }
 
     #[test]
@@ -1855,13 +1855,15 @@ mod tests {
     }
 
     #[test]
-    fn retain_on_empty_candidates() {
+    fn empty_candidates_replace_serving_state() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("routing-config.json");
         std::fs::write(&path, r#"{"local_site":"a","candidates":[]}"#).unwrap();
         let (snap, hash) = make_valid_snapshot();
         handle_overlay_reload(&path, &snap, None);
-        assert_eq!(snap.load().content_hash, hash);
+        let loaded = snap.load();
+        assert_ne!(loaded.content_hash, hash);
+        assert!(loaded.candidates.is_empty());
     }
 
     #[test]
