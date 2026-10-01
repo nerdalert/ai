@@ -689,7 +689,7 @@ fn validate_bounded_nonblank(field: &str, value: &str, max_len: usize) -> Result
 ///
 /// Extracts `candidates`, `local_site`, and `network` from the value,
 /// canonicalizes via RFC 8785, and computes SHA-256.
-fn compute_semantic_digest(overlay_value: &serde_json::Value) -> Result<String, FilterError> {
+pub(super) fn compute_semantic_digest(overlay_value: &serde_json::Value) -> Result<String, FilterError> {
     let mut semantic = serde_json::Map::new();
     if let Some(candidates) = overlay_value.get("candidates") {
         semantic.insert("candidates".to_owned(), candidates.clone());
@@ -1071,7 +1071,7 @@ async fn run_event_loop(
 }
 
 /// Read, validate, and swap the overlay snapshot.
-fn handle_overlay_reload(
+pub(super) fn handle_overlay_reload(
     path: &Path,
     snapshot: &ArcSwap<RouteSnapshot>,
     expected_scope: Option<&ExpectedOverlayScope>,
@@ -1451,6 +1451,25 @@ mod tests {
         }"#;
         let result = RouteSnapshot::from_overlay(json.as_bytes());
         assert!(result.is_err(), "empty candidates should be rejected");
+    }
+
+    #[test]
+    fn empty_weighted_versioned_envelope_is_valid_but_legacy_is_not() {
+        let weighted = make_empty_weighted_envelope_json();
+        let snapshot = RouteSnapshot::from_overlay(weighted.as_bytes())
+            .expect("explicit empty weighted envelope is a valid no-provider state");
+        assert!(snapshot.candidates.is_empty());
+        assert_eq!(snapshot.selection_mode, PickerPolicy::WeightedRandom);
+        assert!(snapshot.semantic_revision.is_some());
+
+        let legacy_weighted = r#"{
+            "local_site": "site-a",
+            "selection_policy": {"mode": "weightedRandom"},
+            "candidates": []
+        }"#;
+        let error = RouteSnapshot::from_overlay(legacy_weighted.as_bytes())
+            .expect_err("empty legacy overlay must remain invalid");
+        assert!(error.to_string().contains("must not be empty"));
     }
 
     #[test]
@@ -1845,6 +1864,26 @@ mod tests {
         assert_weighted_snapshot_weights(&snapshot, initial_revision.as_deref(), [25, 75]);
     }
 
+    #[test]
+    fn weighted_empty_reload_advances_serving_revision_and_removes_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routing-overlay.json");
+        let initial = make_weighted_envelope_json([70, 30]);
+        let initial_snapshot = RouteSnapshot::from_overlay(initial.as_bytes()).unwrap();
+        let initial_revision = initial_snapshot.semantic_revision.clone();
+        let snapshot = Arc::new(ArcSwap::from_pointee(initial_snapshot));
+
+        let empty = make_empty_weighted_envelope_json();
+        std::fs::write(&path, empty).unwrap();
+        handle_overlay_reload(&path, &snapshot, None);
+
+        let serving = snapshot.load();
+        assert!(serving.candidates.is_empty());
+        assert_eq!(serving.selection_mode, PickerPolicy::WeightedRandom);
+        assert_ne!(serving.semantic_revision, initial_revision);
+        assert!(serving.group_index.is_empty());
+    }
+
     fn assert_weighted_snapshot_weights(
         snapshot: &ArcSwap<RouteSnapshot>,
         previous_revision: Option<&str>,
@@ -2137,6 +2176,22 @@ mod tests {
                 "traffic_weight": weights[1]
             }
         ]);
+        let digest = compute_semantic_digest(overlay).unwrap();
+        envelope["revision"]["value"] = serde_json::json!(digest);
+        envelope["content_digest"]["value"] = serde_json::json!(digest);
+        serde_json::to_string(&envelope).unwrap()
+    }
+
+    fn make_empty_weighted_envelope_json() -> String {
+        make_empty_envelope_with_mode("weightedRandom")
+    }
+
+    fn make_empty_envelope_with_mode(mode: &str) -> String {
+        let mut envelope: serde_json::Value =
+            serde_json::from_str(&make_envelope_json("site-a", "llama", "cluster-a", "test-net")).unwrap();
+        let overlay = envelope.get_mut("overlay").expect("generated envelope has overlay");
+        overlay["selection_policy"] = serde_json::json!({"mode": mode});
+        overlay["candidates"] = serde_json::json!([]);
         let digest = compute_semantic_digest(overlay).unwrap();
         envelope["revision"]["value"] = serde_json::json!(digest);
         envelope["content_digest"]["value"] = serde_json::json!(digest);

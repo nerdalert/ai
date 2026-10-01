@@ -3141,6 +3141,45 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn empty_weighted_overlay_reload_advances_revision_and_denies_new_requests() {
+        let initial = include_bytes!("../../../tests/fixtures/overlay-contract/v1/valid-minimal.json");
+        let initial_snapshot = RouteSnapshot::from_overlay(initial).unwrap();
+        let initial_revision = initial_snapshot
+            .semantic_revision
+            .as_deref()
+            .expect("fixture has semantic revision")
+            .to_owned();
+        let shared = Arc::new(ArcSwap::from_pointee(initial_snapshot));
+        let filter = make_affinity_filter(Arc::clone(&shared), None);
+
+        let mut before_req = crate::test_utils::make_request(Method::POST, "/chat");
+        before_req
+            .headers
+            .insert("X-Model", HeaderValue::from_static("model-a"));
+        let mut before_ctx = crate::test_utils::make_filter_context(&before_req);
+        let before_action = filter.on_request(&mut before_ctx).await.unwrap();
+        assert!(matches!(before_action, FilterAction::Continue));
+        assert!(before_ctx.cluster.is_some());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routing-overlay.json");
+        std::fs::write(&path, make_empty_weighted_envelope_json()).unwrap();
+        overlay::handle_overlay_reload(&path, &shared, None);
+
+        let serving = shared.load();
+        let serving_revision = serving.semantic_revision.as_deref().expect("new envelope revision");
+        assert_ne!(serving_revision, initial_revision);
+        assert!(serving.candidates.is_empty());
+
+        let mut after_req = crate::test_utils::make_request(Method::POST, "/chat");
+        after_req.headers.insert("X-Model", HeaderValue::from_static("model-a"));
+        let mut after_ctx = crate::test_utils::make_filter_context(&after_req);
+        let after_action = filter.on_request(&mut after_ctx).await.unwrap();
+        assert!(matches!(after_action, FilterAction::Reject(rejection) if rejection.status == 404));
+        assert!(after_ctx.cluster.is_none());
+    }
+
     // ---- Overlay revision header ----
 
     #[tokio::test]
@@ -3447,5 +3486,36 @@ mod tests {
             ]
         });
         RouteSnapshot::from_overlay(serde_json::to_vec(&json).unwrap().as_slice()).unwrap()
+    }
+
+    fn make_empty_weighted_envelope_json() -> String {
+        let overlay_payload = serde_json::json!({
+            "local_site": "site-a",
+            "network": "test-net",
+            "selection_policy": {"mode": "weightedRandom"},
+            "candidates": []
+        });
+        let digest = overlay::compute_semantic_digest(&overlay_payload).unwrap();
+        serde_json::to_string(&serde_json::json!({
+            "schema_version": "1.0.0",
+            "revision": {"kind": "content_addressed", "algorithm": "sha256", "value": digest},
+            "content_digest": {"algorithm": "sha256", "value": digest},
+            "scope": {
+                "network": "test-net",
+                "gateway": "gw",
+                "namespace": "ns",
+                "local_site": "site-a"
+            },
+            "provenance": {
+                "producer": "test",
+                "producer_version": "0.1.0",
+                "source_name": "test-net",
+                "source_uid": "test-uid",
+                "source_generation": 1,
+                "rendered_at": "2026-10-01T00:00:00Z"
+            },
+            "overlay": overlay_payload
+        }))
+        .unwrap()
     }
 }
