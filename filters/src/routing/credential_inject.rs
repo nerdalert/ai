@@ -70,9 +70,23 @@
 //!     env_var: OTHER_API_TOKEN    # token from environment variable
 //! ```
 //!
+//! A consumer may start before any route has a credential:
+//!
+//! ```yaml
+//! filter: credential_inject
+//! credentials: []
+//! projected_credential_mount_base: /run/secrets/projected-credentials
+//! ```
+//!
 //! The `name`/`namespace`/`key` triple uniquely identifies a Kubernetes
 //! Secret entry and must match what the configuration producer wrote into the
-//! routing overlay candidate.
+//! routing overlay candidate. Configured `file:` entries use their explicit
+//! path unchanged. With `projected_credential_mount_base`, a later overlay
+//! reference not present in the startup table is resolved under
+//! `{root}/{namespace}/{name}/{key}` on demand. Including the namespace keeps
+//! same-name Secrets in different namespaces distinct. An absent, unsafe, or
+//! invalid projected file rejects the request with HTTP 503; the filter never
+//! passes a selected credential-bearing route through without injection.
 
 use std::{
     collections::HashMap,
@@ -125,8 +139,20 @@ const DEFAULT_APIKEY_HEADER: &str = "x-api-key";
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CredentialInjectConfig {
-    /// Credential entries, keyed by secretRef (name/namespace/key).
+    /// Credential entries, keyed by secretRef (name/namespace/key). May be
+    /// empty only when `projected_credential_mount_base` is configured.
+    #[serde(default)]
     credentials: Vec<CredentialEntryConfig>,
+
+    /// Optional root containing projected Secret directories. When configured,
+    /// a credential reference selected from a live routing overlay may be
+    /// resolved from `{root}/{namespace}/{secret-name}/{secret-key}` even when
+    /// it was not present in the startup credential table. Including the
+    /// namespace keeps same-name Secrets distinct. This lets a no-route startup
+    /// safely accept later credential-bearing overlay revisions: an absent or
+    /// unmounted file rejects the request with 503.
+    #[serde(default)]
+    projected_credential_mount_base: Option<PathBuf>,
 }
 
 /// A single configured credential entry.
@@ -293,6 +319,9 @@ impl Drop for CredentialReloadHandle {
 pub struct CredentialInjectFilter {
     /// Credential reference → resolved injectable credential.
     credentials: HashMap<CredentialRef, ConfiguredCredential>,
+    /// Optional root for fail-closed, request-time resolution of projected
+    /// credentials introduced by a later overlay revision.
+    projected_credential_mount_base: Option<PathBuf>,
     /// Bounded watcher lifetime for file-backed credentials.
     _reload_handle: Option<CredentialReloadHandle>,
 }
@@ -308,7 +337,7 @@ impl CredentialInjectFilter {
     /// # Errors
     ///
     /// Returns [`FilterError`] if:
-    /// - `credentials` is empty
+    /// - `credentials` is empty and no projected mount base is configured
     /// - any entry has more than one token source (`value`, `env_var`, `file`) or none
     /// - any `env_var` is not set in the environment
     /// - any `file` does not exist, is unreadable, or is empty
@@ -322,8 +351,16 @@ impl CredentialInjectFilter {
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: CredentialInjectConfig = parse_filter_config("credential_inject", config)?;
 
-        if cfg.credentials.is_empty() || cfg.credentials.len() > MAX_CREDENTIALS {
-            return Err(format!("credential_inject: credentials must contain 1-{MAX_CREDENTIALS} entries").into());
+        if cfg.credentials.len() > MAX_CREDENTIALS {
+            return Err(
+                format!("credential_inject: credentials must contain at most {MAX_CREDENTIALS} entries").into(),
+            );
+        }
+        if cfg.credentials.is_empty() && cfg.projected_credential_mount_base.is_none() {
+            return Err("credential_inject: empty credentials requires projected_credential_mount_base".into());
+        }
+        if let Some(base) = &cfg.projected_credential_mount_base {
+            validate_projected_mount_base(base)?;
         }
 
         let mut credentials = HashMap::with_capacity(cfg.credentials.len());
@@ -376,6 +413,7 @@ impl CredentialInjectFilter {
 
         Ok(Box::new(Self {
             credentials,
+            projected_credential_mount_base: cfg.projected_credential_mount_base,
             _reload_handle: reload_handle,
         }))
     }
@@ -400,7 +438,27 @@ impl HttpFilter for CredentialInjectFilter {
             return Ok(FilterAction::Reject(Rejection::status(503)));
         };
 
-        let Some(configured) = self.credentials.get(&selected.reference) else {
+        let cred = if let Some(configured) = self.credentials.get(&selected.reference) {
+            // Configured entries retain the existing atomically refreshed
+            // snapshot path. A configured-but-invalid entry must not fall
+            // through to a second source.
+            let snapshot = configured.snapshot.load_full();
+            let Some(credential) = snapshot.credential.as_ref() else {
+                return Ok(FilterAction::Reject(Rejection::status(503)));
+            };
+            credential.clone()
+        } else if let Some(base) = &self.projected_credential_mount_base {
+            // Candidate references are part of the validated, scoped routing
+            // overlay. Resolve newly introduced references only below the
+            // configured mount root; missing/invalid files fail closed.
+            match resolve_projected_credential(base.clone(), selected.clone()).await {
+                Ok(credential) => credential,
+                Err(error) => {
+                    tracing::debug!(error = %error, "credential_inject: projected credential unavailable; failing closed");
+                    return Ok(FilterAction::Reject(Rejection::status(503)));
+                },
+            }
+        } else {
             // Log the reference identity (not the token) to assist debugging.
             tracing::debug!(
                 name = %selected.reference.name,
@@ -411,17 +469,9 @@ impl HttpFilter for CredentialInjectFilter {
             return Ok(FilterAction::Reject(Rejection::status(503)));
         };
 
-        // Request handling only looks up and atomically loads an immutable
-        // snapshot. Filesystem I/O, validation, and publication happen in the
-        // bounded watcher thread after projected-volume events.
-        let snapshot = configured.snapshot.load_full();
-        let Some(cred) = snapshot.credential.as_ref() else {
-            return Ok(FilterAction::Reject(Rejection::status(503)));
-        };
-
         // The overlay candidate and the configured entry must agree on how this
-        // secret is injected. A producer/config disagreement fails closed
-        // rather than sending a bearer token where an apikey header is expected.
+        // secret is injected. Static-table entries are cross-checked; dynamic
+        // projected entries use the already validated overlay strategy.
         if cred.strategy != selected.strategy {
             tracing::debug!(
                 name = %selected.reference.name,
@@ -460,6 +510,7 @@ impl HttpFilter for CredentialInjectFilter {
 // -----------------------------------------------------------------------------
 
 /// Credential reference selected by the routing filter, with its strategy.
+#[derive(Clone)]
 struct SelectedCredential {
     /// Strategy declared by the selected route candidate.
     strategy: &'static str,
@@ -654,6 +705,80 @@ fn resolve_file_credential(
         header_name: header_name.clone(),
         header_value: Zeroizing::new(header_value),
     })
+}
+
+/// Validate the trusted root used for overlay-selected projected credentials.
+fn validate_projected_mount_base(base: &Path) -> Result<(), FilterError> {
+    if !base.is_absolute()
+        || base == Path::new("/")
+        || base.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err(
+            "credential_inject: projected_credential_mount_base must be a non-root absolute path without dot segments"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// Build the projected file path for a reference carried by the validated
+/// routing overlay. Every locator field becomes one distinct path component.
+fn projected_credential_path(base: &Path, reference: &CredentialRef) -> Result<PathBuf, FilterError> {
+    for (field, value) in [
+        ("name", reference.name.as_str()),
+        ("namespace", reference.namespace.as_str()),
+        ("key", reference.key.as_str()),
+    ] {
+        validate_bounded(field, value, MAX_REFERENCE_LEN)?;
+    }
+    for (field, component) in [
+        ("namespace", reference.namespace.as_str()),
+        ("name", reference.name.as_str()),
+        ("key", reference.key.as_str()),
+    ] {
+        if component == "."
+            || component == ".."
+            || component
+                .chars()
+                .any(|character| matches!(character, '/' | '\\' | '\0'))
+            || Path::new(component).components().count() != 1
+        {
+            return Err(format!("credential_inject: projected credential {field} is not a safe path component").into());
+        }
+    }
+    Ok(base
+        .join(&reference.namespace)
+        .join(&reference.name)
+        .join(&reference.key))
+}
+
+/// Resolve a credential introduced by an accepted overlay from the configured
+/// Secret projection root. File I/O runs on Tokio's blocking pool and uses the
+/// same bounded validation and zeroization path as configured file entries.
+async fn resolve_projected_credential(
+    base: PathBuf,
+    selected: SelectedCredential,
+) -> Result<ResolvedCredential, FilterError> {
+    let path = projected_credential_path(&base, &selected.reference)?;
+    let reference = selected.reference;
+    let strategy = selected.strategy;
+    let header_name = if strategy == STRATEGY_BEARER_TOKEN {
+        AUTHORIZATION
+    } else {
+        HeaderName::from_static(DEFAULT_APIKEY_HEADER)
+    };
+    tokio::task::spawn_blocking(move || {
+        resolve_file_credential(path.to_string_lossy().as_ref(), &reference, strategy, &header_name)
+    })
+    .await
+    .map_err(|error| -> FilterError {
+        format!("credential_inject: projected credential read task failed: {error}").into()
+    })?
 }
 
 /// Read one projected credential using the same bounded validation path for
@@ -909,9 +1034,22 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    fn empty_credentials_rejected() {
+    fn empty_credentials_require_projected_mount_base() {
         let err = parse_err("credentials: []");
-        assert!(err.to_string().contains("must contain"), "{err}");
+        assert!(err.to_string().contains("projected_credential_mount_base"), "{err}");
+    }
+
+    #[test]
+    fn empty_credentials_with_projected_mount_base_is_a_valid_fail_closed_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = format!(
+            "credentials: []\nprojected_credential_mount_base: '{}'\n",
+            dir.path().display()
+        );
+        assert!(
+            parse(&yaml).is_ok(),
+            "dynamic projected mode should permit an empty startup table"
+        );
     }
 
     #[test]
@@ -1090,6 +1228,123 @@ mod tests {
             ctx.request_headers_to_set.is_empty(),
             "no Authorization injected without credential"
         );
+    }
+
+    #[tokio::test]
+    async fn empty_startup_table_injects_credential_from_later_overlay_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret_dir = dir.path().join("test-ns").join("provider-secret");
+        std::fs::create_dir_all(&secret_dir).unwrap();
+        std::fs::write(secret_dir.join("token"), "projected-token\n").unwrap();
+        let yaml = format!(
+            "credentials: []\nprojected_credential_mount_base: '{}'\n",
+            dir.path().display()
+        );
+        let filter = parse(&yaml).unwrap();
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers
+            .insert(AUTHORIZATION, HeaderValue::from_static("Bearer caller-token"));
+        req.headers.insert("x-api-key", HeaderValue::from_static("caller-key"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        set_credential_metadata(&mut ctx, "apikey", "provider-secret", "test-ns", "token");
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(matches!(action, FilterAction::Continue));
+        assert!(ctx.request_headers_to_remove.contains(&AUTHORIZATION));
+        assert!(
+            ctx.request_headers_to_remove
+                .contains(&HeaderName::from_static("x-api-key"))
+        );
+        assert_eq!(ctx.request_headers_to_set.len(), 1);
+        assert_eq!(ctx.request_headers_to_set[0].0.as_str(), "x-api-key");
+        assert_eq!(ctx.request_headers_to_set[0].1, "projected-token");
+    }
+
+    #[tokio::test]
+    async fn projected_credentials_with_same_name_and_key_are_namespace_distinct() {
+        let dir = tempfile::tempdir().unwrap();
+        for (namespace, token) in [("namespace-a", "token-from-a"), ("namespace-b", "token-from-b")] {
+            let secret_dir = dir.path().join(namespace).join("shared-secret");
+            std::fs::create_dir_all(&secret_dir).unwrap();
+            std::fs::write(secret_dir.join("token"), token).unwrap();
+        }
+
+        // This legacy-layout file would alias both namespace references if the
+        // resolver ignored namespace. Neither selected Secret may read it.
+        let legacy_dir = dir.path().join("shared-secret");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        std::fs::write(legacy_dir.join("token"), "wrong-legacy-token").unwrap();
+
+        let yaml = format!(
+            "credentials: []\nprojected_credential_mount_base: '{}'\n",
+            dir.path().display()
+        );
+        let filter = parse(&yaml).unwrap();
+        let req = crate::test_utils::make_request(Method::POST, "/chat");
+
+        for (namespace, expected_token) in [("namespace-a", "token-from-a"), ("namespace-b", "token-from-b")] {
+            let mut ctx = crate::test_utils::make_filter_context(&req);
+            set_credential_metadata(&mut ctx, "apikey", "shared-secret", namespace, "token");
+
+            let action = filter.on_request(&mut ctx).await.unwrap();
+            assert!(matches!(action, FilterAction::Continue));
+            assert_eq!(ctx.request_headers_to_set.len(), 1);
+            assert_eq!(ctx.request_headers_to_set[0].0.as_str(), "x-api-key");
+            assert_eq!(ctx.request_headers_to_set[0].1, expected_token);
+        }
+    }
+
+    #[test]
+    fn projected_path_includes_namespace_and_rejects_namespace_traversal() {
+        let base = Path::new("/run/secrets/projected-credentials");
+        let reference = CredentialRef {
+            name: "shared-secret".to_owned(),
+            namespace: "tenant-a".to_owned(),
+            key: "token".to_owned(),
+        };
+        assert_eq!(
+            projected_credential_path(base, &reference).unwrap(),
+            Path::new("/run/secrets/projected-credentials/tenant-a/shared-secret/token")
+        );
+
+        for namespace in ["../other", "tenant/a", "tenant\\a"] {
+            let unsafe_reference = CredentialRef {
+                namespace: namespace.to_owned(),
+                ..reference.clone()
+            };
+            assert!(
+                projected_credential_path(base, &unsafe_reference).is_err(),
+                "unsafe namespace path component {namespace:?} must be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_startup_table_rejects_missing_or_unsafe_overlay_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = format!(
+            "credentials: []\nprojected_credential_mount_base: '{}'\n",
+            dir.path().display()
+        );
+        let filter = parse(&yaml).unwrap();
+        for name in ["missing-secret", "../outside"] {
+            let req = crate::test_utils::make_request(Method::POST, "/chat");
+            let mut ctx = crate::test_utils::make_filter_context(&req);
+            set_credential_metadata(&mut ctx, "bearer_token", name, "test-ns", "token");
+            let action = filter.on_request(&mut ctx).await.unwrap();
+            assert!(
+                matches!(action, FilterAction::Reject(rejection) if rejection.status == 503),
+                "missing or unsafe projected ref {name} must fail closed"
+            );
+            assert!(ctx.request_headers_to_set.is_empty());
+        }
+
+        let req = crate::test_utils::make_request(Method::POST, "/chat");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        set_credential_metadata(&mut ctx, "bearer_token", "valid-name", "../outside", "token");
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 503));
+        assert!(ctx.request_headers_to_set.is_empty());
     }
 
     // -------------------------------------------------------------------------
