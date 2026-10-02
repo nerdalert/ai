@@ -426,7 +426,8 @@ enum AffinityOutcome<'a> {
 /// - **rendered:** The producer constructed the envelope.
 /// - **distributed:** The producer applied it to the destination `ConfigMap`.
 /// - **accepted:** Praxis AI parsed, scope-checked, and digest-verified it.
-/// - **serving:** a request selected a route from that exact snapshot.
+/// - **serving:** the active snapshot used for new routing decisions, including an authoritative no-route decision from
+///   an empty candidate list.
 ///
 /// Invalid cold-start envelopes fail filter construction. Invalid reloads
 /// retain the same-process last-known-good snapshot. Envelope-mode provider
@@ -434,9 +435,11 @@ enum AffinityOutcome<'a> {
 /// candidate selection.
 ///
 /// **Scope:** overlay hot reload swaps the candidate list and `local_site`
-/// only.  It cannot add or remove `load_balancer` clusters, change
-/// cluster endpoints or TLS configuration, or inject credential values.
-/// Those changes require a full pipeline reload or pod restart.
+/// only. It cannot add or remove `load_balancer` clusters or change cluster
+/// endpoints or TLS configuration; those changes require a full pipeline
+/// reload or pod restart. Overlay files never carry credential values. An
+/// already-configured projected credential resolver can use a newly selected,
+/// already-mounted Secret without rebuilding the filter pipeline.
 /// Every cluster name that may appear in any overlay version must
 /// already be configured in the downstream `load_balancer` filter.
 /// An overlay that references an unknown cluster will cause
@@ -476,7 +479,7 @@ impl IntelligentRouteFilter {
     /// - both `overlay_file` and `candidates` are set
     /// - neither `overlay_file` nor `candidates` is set
     /// - the overlay file cannot be read or parsed
-    /// - the candidate list is empty or invalid
+    /// - static or legacy candidates are empty, or any candidate is invalid
     /// - the model header is invalid
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let mut cfg: IntelligentRouteConfig = parse_filter_config("intelligent_route", config)?;
@@ -1193,7 +1196,7 @@ mod tests {
 
     use super::*;
 
-    fn versioned_envelope(candidates: serde_json::Value) -> String {
+    fn versioned_envelope(candidates: &serde_json::Value) -> String {
         let overlay = serde_json::json!({
             "network": "test-net",
             "local_site": "site-a",
@@ -1283,7 +1286,7 @@ mod tests {
     async fn cold_start_with_empty_versioned_overlay_rejects_without_selecting_cluster() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("routing-overlay.json");
-        std::fs::write(&path, versioned_envelope(serde_json::json!([]))).unwrap();
+        std::fs::write(&path, versioned_envelope(&serde_json::json!([]))).unwrap();
         let config = serde_json::json!({
             "overlay_file": path.to_string_lossy(),
             "reload": { "enabled": false },
@@ -1307,7 +1310,7 @@ mod tests {
             "fresh": true,
             "stable_id": "provider-a-llama-3"
         }]);
-        std::fs::write(&path, versioned_envelope(candidate.clone())).unwrap();
+        std::fs::write(&path, versioned_envelope(&candidate)).unwrap();
         let config = serde_json::json!({
             "overlay_file": path.to_string_lossy(),
             "reload": { "enabled": true, "debounce_ms": 10 },
@@ -1325,7 +1328,7 @@ mod tests {
         assert!(matches!(action, FilterAction::Continue));
         assert_eq!(context.cluster.as_deref(), Some("provider-a"));
 
-        std::fs::write(&path, versioned_envelope(serde_json::json!([]))).unwrap();
+        std::fs::write(&path, versioned_envelope(&serde_json::json!([]))).unwrap();
         let withdrawn = poll_request_until(
             filter.as_ref(),
             "llama-3",
@@ -1346,7 +1349,7 @@ mod tests {
             "invalid update must retain the empty last-known-good snapshot"
         );
 
-        std::fs::write(&path, versioned_envelope(candidate)).unwrap();
+        std::fs::write(&path, versioned_envelope(&candidate)).unwrap();
         let restored = poll_request_until(filter.as_ref(), "llama-3", "session-1", |action| {
             matches!(action, FilterAction::Continue)
         })
@@ -1363,7 +1366,7 @@ mod tests {
             {"kind": "inference_model", "name": "model-a", "site": "site-a", "cluster": "provider-a", "fresh": true},
             {"kind": "inference_model", "name": "model-b", "site": "site-a", "cluster": "provider-b", "fresh": true}
         ]);
-        std::fs::write(&path, versioned_envelope(candidates)).unwrap();
+        std::fs::write(&path, versioned_envelope(&candidates)).unwrap();
         let config = serde_json::json!({
             "overlay_file": path.to_string_lossy(),
             "reload": { "enabled": true, "debounce_ms": 10 },
@@ -1375,7 +1378,7 @@ mod tests {
         let remaining = serde_json::json!([
             {"kind": "inference_model", "name": "model-b", "site": "site-a", "cluster": "provider-b", "fresh": true}
         ]);
-        std::fs::write(&path, versioned_envelope(remaining)).unwrap();
+        std::fs::write(&path, versioned_envelope(&remaining)).unwrap();
         let withdrawn = poll_request_until(
             filter.as_ref(),
             "model-a",

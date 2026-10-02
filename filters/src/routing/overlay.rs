@@ -765,6 +765,10 @@ fn validate_selection_mode(candidates: &[RouteCandidate], mode: PickerPolicy) ->
 // -----------------------------------------------------------------------------
 
 /// Convert overlay candidates to validated [`RouteCandidate`]s.
+#[expect(
+    clippy::too_many_lines,
+    reason = "overlay conversion keeps candidate fields in one mapping"
+)]
 fn overlay_to_candidates(doc: &OverlayDocument, allow_empty: bool) -> Result<Vec<RouteCandidate>, FilterError> {
     let raw: Vec<CandidateConfig> = doc
         .candidates
