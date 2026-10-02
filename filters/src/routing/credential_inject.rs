@@ -158,7 +158,9 @@ struct CredentialInjectConfig {
     /// use `x-api-key`; providers requiring another header need a configured
     /// credential entry. This lets a no-route startup safely accept later
     /// credential-bearing overlay revisions: an absent or unmounted file
-    /// rejects the request with 503 after the bounded cache refresh interval.
+    /// rejects the request with 503 after the 250 ms cache refresh interval.
+    /// The root must be a trusted, read-only projection; a process allowed to
+    /// rewrite its symlinks concurrently is outside this containment contract.
     #[serde(default)]
     projected_credential_mount_base: Option<PathBuf>,
 }
