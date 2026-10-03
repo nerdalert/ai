@@ -90,6 +90,12 @@
 //! Projected `apikey` references use `x-api-key`; a different provider header
 //! requires a configured credential entry. Projected values are cached for at
 //! most 250 ms so high-traffic routes do not read the Secret on every request.
+//! A rotated or revoked token may therefore still be injected during that
+//! interval. Overlay digest and scope validation do not authenticate the
+//! publisher: use this mode only with a trusted overlay publisher and mount
+//! only Secrets this gateway is authorized to use. The projection must be
+//! read-only to untrusted processes; concurrent symlink rewriting is outside
+//! the path-containment guarantee.
 
 use std::{
     collections::HashMap,
@@ -159,8 +165,11 @@ struct CredentialInjectConfig {
     /// credential entry. This lets a no-route startup safely accept later
     /// credential-bearing overlay revisions: an absent or unmounted file
     /// rejects the request with 503 after the 250 ms cache refresh interval.
-    /// The root must be a trusted, read-only projection; a process allowed to
-    /// rewrite its symlinks concurrently is outside this containment contract.
+    /// A rotated or revoked token may be used until that interval expires.
+    /// Overlay digest and scope validation do not authenticate the publisher:
+    /// use only a trusted publisher and mount only Secrets this gateway is
+    /// authorized to inject. The root must be read-only to untrusted processes;
+    /// concurrent symlink rewriting is outside the containment guarantee.
     #[serde(default)]
     projected_credential_mount_base: Option<PathBuf>,
 }
@@ -1430,6 +1439,49 @@ mod tests {
         let (missing, headers) = inject().await;
         assert!(matches!(missing, FilterAction::Reject(rejection) if rejection.status == 503));
         assert!(headers.is_empty());
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "missing, invalid, and recovered files form one cache lifecycle"
+    )]
+    async fn projected_cache_recovers_after_missing_and_invalid_files_become_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret_dir = dir.path().join("test-ns").join("provider-secret");
+        std::fs::create_dir_all(&secret_dir).unwrap();
+        let token_path = secret_dir.join("token");
+        let filter = parse(&format!(
+            "credentials: []\nprojected_credential_mount_base: '{}'\n",
+            dir.path().display()
+        ))
+        .unwrap();
+        let request = crate::test_utils::make_request(Method::POST, "/chat");
+        let inject = || async {
+            let mut ctx = crate::test_utils::make_filter_context(&request);
+            set_credential_metadata(&mut ctx, "apikey", "provider-secret", "test-ns", "token");
+            let action = filter.on_request(&mut ctx).await.unwrap();
+            (action, ctx.request_headers_to_set)
+        };
+
+        let (missing, headers) = inject().await;
+        assert!(matches!(missing, FilterAction::Reject(rejection) if rejection.status == 503));
+        assert!(headers.is_empty());
+
+        std::fs::write(&token_path, " \n").unwrap();
+        tokio::time::sleep(PROJECTED_CACHE_TTL + Duration::from_millis(30)).await;
+        let (invalid, headers) = inject().await;
+        assert!(matches!(invalid, FilterAction::Reject(rejection) if rejection.status == 503));
+        assert!(headers.is_empty());
+
+        std::fs::write(&token_path, "recovered-token").unwrap();
+        let (cached_failure, headers) = inject().await;
+        assert!(matches!(cached_failure, FilterAction::Reject(rejection) if rejection.status == 503));
+        assert!(headers.is_empty());
+        tokio::time::sleep(PROJECTED_CACHE_TTL + Duration::from_millis(30)).await;
+        let (recovered, headers) = inject().await;
+        assert!(matches!(recovered, FilterAction::Continue));
+        assert_eq!(headers[0].1, "recovered-token");
     }
 
     #[cfg(unix)]
