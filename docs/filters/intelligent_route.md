@@ -56,6 +56,8 @@ Supports two modes:
 | `candidates[].name` | string | yes | Capability name (model name, tool name, or agent name). |
 | `candidates[].site` | string | yes | Site that owns this capability. |
 | `candidates[].traffic_weight` | integer | no | Optional weight for an overlay using `selection_policy.mode: weightedRandom`. Inline static candidates cannot use traffic weights. |
+| `selection_policy` | SelectionPolicy | no | Explicit selection policy for an empty inline candidate list. Generated Grid consumer configuration uses `weightedRandom` to represent an intentional no-provider state. Non-empty inline candidates continue to use the existing static selection behavior. |
+| `selection_policy.mode` | `deterministic` \| `roundRobin` \| `random` \| `weightedRandom` | yes | Selection mode applied locally by `intelligent_route`. |
 | `local_site` | string | no | Name of the local site (required in static mode, provided by overlay in overlay mode). |
 | `model_header` | string | no | Header name that carries the model name (default: `X-Model`). |
 | `skip_paths` | string[] | no | Request-path prefixes that bypass model resolution entirely. Management and discovery endpoints (model listing, subscriptions, API-key management, health) carry no routable model; a matching request returns `Continue` before any model lookup. Defaults to the well-known OpenAI-style management paths; set an explicit list to override, or `[]` to disable path skipping. See `path_is_management` for the match rule. |
