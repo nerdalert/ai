@@ -3142,6 +3142,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_weighted_overlay_does_not_reuse_an_existing_affinity_binding() {
+        let shared = Arc::new(ArcSwap::from_pointee(make_weighted_snapshot(90, 10)));
+        let filter = make_affinity_filter(Arc::clone(&shared), Some(make_test_affinity()));
+
+        let mut first = crate::test_utils::make_request(Method::POST, "/chat");
+        first.headers.insert("X-Model", HeaderValue::from_static("llama"));
+        first.headers.insert("x-session-id", HeaderValue::from_static("sticky"));
+        let mut first_ctx = crate::test_utils::make_filter_context(&first);
+        let first_action = filter.on_request(&mut first_ctx).await.unwrap();
+        assert!(matches!(first_action, FilterAction::Continue));
+        assert!(first_ctx.cluster.is_some(), "initial route selects a provider");
+        assert_eq!(first_ctx.get_metadata("intelligent_route.session.bound"), Some("true"));
+        assert_eq!(
+            first_ctx.get_metadata("intelligent_route.session.reused"),
+            Some("false")
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routing-overlay.json");
+        std::fs::write(&path, make_empty_weighted_envelope_json()).unwrap();
+        overlay::handle_overlay_reload(&path, &shared, None);
+
+        let serving = shared.load();
+        assert!(serving.candidates.is_empty());
+
+        let mut bound = crate::test_utils::make_request(Method::POST, "/chat");
+        bound.headers.insert("X-Model", HeaderValue::from_static("llama"));
+        bound.headers.insert("x-session-id", HeaderValue::from_static("sticky"));
+        let mut bound_ctx = crate::test_utils::make_filter_context(&bound);
+        let action = filter.on_request(&mut bound_ctx).await.unwrap();
+
+        assert!(
+            matches!(action, FilterAction::Reject(rejection) if rejection.status == 404),
+            "an existing affinity binding must not route through an empty serving revision"
+        );
+        assert!(
+            bound_ctx.cluster.is_none(),
+            "the withdrawn provider must not be selected from stale affinity"
+        );
+    }
+
+    #[tokio::test]
     async fn empty_weighted_overlay_reload_advances_revision_and_denies_new_requests() {
         let initial = include_bytes!("../../../tests/fixtures/overlay-contract/v1/valid-minimal.json");
         let initial_snapshot = RouteSnapshot::from_overlay(initial).unwrap();
