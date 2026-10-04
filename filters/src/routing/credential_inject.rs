@@ -416,6 +416,8 @@ impl Drop for CredentialReloadHandle {
 pub struct CredentialInjectFilter {
     /// Credential reference → resolved injectable credential.
     credentials: HashMap<CredentialRef, ConfiguredCredential>,
+    /// Headers that may carry caller-supplied credentials for any configured entry.
+    credential_headers: Vec<HeaderName>,
     /// Optional root for fail-closed, request-time resolution of projected
     /// credentials introduced by a later overlay revision.
     projected_credential_mount_base: Option<PathBuf>,
@@ -463,6 +465,7 @@ impl CredentialInjectFilter {
         }
 
         let mut credentials = HashMap::with_capacity(cfg.credentials.len());
+        let mut credential_headers = vec![AUTHORIZATION, HeaderName::from_static("x-api-key")];
 
         let mut watched = Vec::new();
         for entry in &cfg.credentials {
@@ -470,6 +473,9 @@ impl CredentialInjectFilter {
             validate_credential_ref(entry)?;
             let strategy = strategy_label(&entry.strategy);
             let header_name = resolve_header_name(entry)?;
+            if !credential_headers.contains(&header_name) {
+                credential_headers.push(header_name.clone());
+            }
             let cred_ref = CredentialRef {
                 name: entry.name.clone(),
                 namespace: entry.namespace.clone(),
@@ -512,6 +518,7 @@ impl CredentialInjectFilter {
 
         Ok(Box::new(Self {
             credentials,
+            credential_headers,
             projected_credential_mount_base: cfg.projected_credential_mount_base,
             projected_cache: Mutex::new(HashMap::new()),
             _reload_handle: reload_handle,
@@ -636,12 +643,11 @@ impl HttpFilter for CredentialInjectFilter {
             // Candidate references are part of the validated, scoped routing
             // overlay. Resolve newly introduced references only below the
             // configured mount root; missing/invalid files fail closed.
-            projected_credential = match self.cached_projected_credential(base, &selected).await {
-                Ok(credential) => credential,
-                Err(error) => {
-                    tracing::debug!(error = %error, "credential_inject: projected credential unavailable; failing closed");
-                    return Ok(FilterAction::Reject(Rejection::status(503)));
-                },
+            projected_credential = if let Ok(credential) = self.cached_projected_credential(base, &selected).await {
+                credential
+            } else {
+                tracing::debug!("credential_inject: projected credential unavailable; failing closed");
+                return Ok(FilterAction::Reject(Rejection::status(503)));
             };
             projected_credential.as_ref()
         } else {
@@ -679,11 +685,10 @@ impl HttpFilter for CredentialInjectFilter {
         let header_value = HeaderValue::from_str(cred.header_value.as_str()).map_err(|e| -> FilterError {
             format!("credential_inject: invalid resolved credential header: {e}").into()
         })?;
-        // Strip every credential-bearing header the caller could smuggle:
-        // the standard pair plus this entry's configured injection header.
-        ctx.request_headers_to_remove.push(AUTHORIZATION);
-        ctx.request_headers_to_remove.push(HeaderName::from_static("x-api-key"));
-        ctx.request_headers_to_remove.push(cred.header_name.clone());
+        // A projected route can select a different credential than the startup table.
+        for header in &self.credential_headers {
+            ctx.request_headers_to_remove.push(header.clone());
+        }
         ctx.request_headers_to_set
             .push((cred.header_name.clone(), header_value));
 
@@ -1659,6 +1664,35 @@ mod tests {
         assert_eq!(ctx.request_headers_to_set[0].1, "provider-token");
     }
 
+    #[tokio::test]
+    async fn projected_credential_strips_other_configured_injection_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let projected_dir = dir.path().join("test-ns/projected-secret");
+        std::fs::create_dir_all(&projected_dir).unwrap();
+        std::fs::write(projected_dir.join("token"), "projected-token").unwrap();
+        let filter = parse(&format!(
+            "credentials:\n  - name: configured-secret\n    namespace: test-ns\n    key: token\n    strategy: apikey\n    header: x-provider-key\n    value: configured-token\nprojected_credential_mount_base: '{}'\n",
+            dir.path().display()
+        ))
+        .unwrap();
+        let mut request = crate::test_utils::make_request(Method::POST, "/chat");
+        request
+            .headers
+            .insert("x-provider-key", HeaderValue::from_static("caller-token"));
+        let mut ctx = crate::test_utils::make_filter_context(&request);
+        set_credential_metadata(&mut ctx, "apikey", "projected-secret", "test-ns", "token");
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(matches!(action, FilterAction::Continue));
+        assert!(
+            ctx.request_headers_to_remove
+                .contains(&HeaderName::from_static("x-provider-key")),
+            "a projected route must strip headers used by other configured credentials"
+        );
+        assert_eq!(ctx.request_headers_to_set[0].0.as_str(), "x-api-key");
+        assert_eq!(ctx.request_headers_to_set[0].1, "projected-token");
+    }
+
     #[test]
     fn projected_path_includes_namespace_and_rejects_namespace_traversal() {
         let base = Path::new("/run/secrets/projected-credentials");
@@ -2397,6 +2431,7 @@ mod tests {
         std::fs::write(secret_dir.join("k"), "token").unwrap();
         let filter = CredentialInjectFilter {
             credentials: HashMap::new(),
+            credential_headers: vec![AUTHORIZATION, HeaderName::from_static("x-api-key")],
             projected_credential_mount_base: Some(dir.path().to_path_buf()),
             projected_cache: Mutex::new(HashMap::new()),
             _reload_handle: None,
