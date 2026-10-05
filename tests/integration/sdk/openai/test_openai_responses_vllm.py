@@ -4265,6 +4265,19 @@ class TestResponsesToChatCompletionsVLLM:
             assert reason in str(exc_info.value), "error message must name the unsupported field"
             assert not forwarded, "unsupported output must not reach the Chat backend"
 
+    def test_malformed_tools_stop_before_chat_backend(self, reasoning_capture_client):
+        client, forwarded = reasoning_capture_client
+        for tools in ([42], "not-an-array"):
+            with pytest.raises(BadRequestError) as exc_info:
+                client.responses.create(
+                    model=VLLM_MODEL,
+                    input="hello",
+                    tools=tools,
+                    store=False,
+                )
+            assert exc_info.value.status_code == 400
+            assert not forwarded, "malformed tools must not reach the Chat backend"
+
     def test_finite_response_round_trip(self, chat_streaming_client):
         response = chat_streaming_client.responses.create(
             model=VLLM_MODEL,
@@ -7128,13 +7141,7 @@ filter_chains:
               # (#1046).
               - filter: openai_file_search_callout
                 vector_store_url: http://{ogx_endpoint}
-                outbound_chain:
-                  name: vector-store-outbound
-                  filters:
-                    - filter: headers
-                      request_set:
-                        - name: X-Vector-Store-Client
-                          value: praxis-ai-gateway
+                outbound_chain: vector-store-outbound
                 timeout_ms: 30000
                 max_response_bytes: 10485760
                 max_total_response_bytes: 67108864
@@ -7170,6 +7177,13 @@ filter_chains:
                 next: inference
               - default: true
                 done: true
+
+  - name: vector-store-outbound
+    filters:
+      - filter: headers
+        request_set:
+          - name: X-Vector-Store-Client
+            value: praxis-ai-gateway
 
 insecure_options:
   allow_private_endpoints: true
@@ -7470,7 +7484,7 @@ class TestFileSearchVLLM:
         # the configured FilteredSubrequestExecutor outbound chain — not merely
         # that a file_search_call item surfaced. The recording shim in front of
         # OGX captured each forwarded request; every one must carry the marker
-        # header the inline outbound_chain injects, which only the executor path
+        # header the named outbound_chain injects, which only the executor path
         # can add.
         captured = VectorStoreWitnessHandler.captured_headers
         assert captured, (
