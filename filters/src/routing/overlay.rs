@@ -1458,9 +1458,19 @@ mod tests {
         let weighted = make_empty_weighted_envelope_json();
         let snapshot = RouteSnapshot::from_overlay(weighted.as_bytes())
             .expect("explicit empty weighted envelope is a valid no-provider state");
-        assert!(snapshot.candidates.is_empty());
-        assert_eq!(snapshot.selection_mode, PickerPolicy::WeightedRandom);
-        assert!(snapshot.semantic_revision.is_some());
+        assert!(
+            snapshot.candidates.is_empty(),
+            "the empty weighted envelope must have no candidates"
+        );
+        assert_eq!(
+            snapshot.selection_mode,
+            PickerPolicy::WeightedRandom,
+            "the empty envelope must preserve its weighted selection policy"
+        );
+        assert!(
+            snapshot.semantic_revision.is_some(),
+            "the versioned envelope must retain its revision"
+        );
 
         let legacy_weighted = r#"{
             "local_site": "site-a",
@@ -1469,7 +1479,10 @@ mod tests {
         }"#;
         let error = RouteSnapshot::from_overlay(legacy_weighted.as_bytes())
             .expect_err("empty legacy overlay must remain invalid");
-        assert!(error.to_string().contains("must not be empty"));
+        assert!(
+            error.to_string().contains("must not be empty"),
+            "legacy empty overlays must remain invalid"
+        );
     }
 
     #[test]
@@ -1878,26 +1891,48 @@ mod tests {
         handle_overlay_reload(&path, &snapshot, None);
 
         let serving = snapshot.load();
-        assert!(serving.candidates.is_empty());
-        assert_eq!(serving.selection_mode, PickerPolicy::WeightedRandom);
-        assert_ne!(serving.semantic_revision, initial_revision);
-        assert!(serving.group_index.is_empty());
+        assert!(
+            serving.candidates.is_empty(),
+            "the empty reload must remove all serving candidates"
+        );
+        assert_eq!(
+            serving.selection_mode,
+            PickerPolicy::WeightedRandom,
+            "the empty reload must keep the weighted selection policy"
+        );
+        assert_ne!(
+            serving.semantic_revision, initial_revision,
+            "the empty reload must advance the serving revision"
+        );
+        assert!(
+            serving.group_index.is_empty(),
+            "no candidate groups may remain after withdrawal"
+        );
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keep related weighted snapshot assertions together"
+    )]
     fn assert_weighted_snapshot_weights(
         snapshot: &ArcSwap<RouteSnapshot>,
         previous_revision: Option<&str>,
         expected: [u32; 2],
     ) {
         let serving = snapshot.load();
-        assert_ne!(serving.semantic_revision.as_deref(), previous_revision);
+        assert_ne!(
+            serving.semantic_revision.as_deref(),
+            previous_revision,
+            "changed weights must advance revision"
+        );
         assert_eq!(
             serving
                 .candidates
                 .iter()
                 .map(|candidate| candidate.traffic_weight)
                 .collect::<Vec<_>>(),
-            [Some(expected[0]), Some(expected[1])]
+            [Some(expected[0]), Some(expected[1])],
+            "the reloaded candidates must carry the new weights"
         );
         let group = serving
             .group_index
@@ -1906,14 +1941,18 @@ mod tests {
             .and_then(|groups| groups.first())
             .expect("updated weighted overlay has an indexed selection group");
         let total_weight = expected.iter().map(|weight| u64::from(*weight)).sum::<u64>();
-        assert_eq!(group.total_weight, total_weight);
+        assert_eq!(
+            group.total_weight, total_weight,
+            "the indexed group must use the new weight total"
+        );
         assert_eq!(
             group
                 .weighted_entries
                 .iter()
                 .map(|entry| entry.cumulative_upper_bound)
                 .collect::<Vec<_>>(),
-            [u64::from(expected[0]), total_weight]
+            [u64::from(expected[0]), total_weight],
+            "the indexed draw bounds must reflect the new candidate weights"
         );
     }
 

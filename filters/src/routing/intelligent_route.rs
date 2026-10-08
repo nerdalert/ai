@@ -3146,10 +3146,15 @@ mod tests {
         let mut second_ctx = crate::test_utils::make_filter_context(&second);
         let _unused = filter.on_request(&mut second_ctx).await.unwrap();
 
-        assert_eq!(second_ctx.cluster.as_deref(), Some(first_cluster.as_ref()));
+        assert_eq!(
+            second_ctx.cluster.as_deref(),
+            Some(first_cluster.as_ref()),
+            "affinity must preserve the selected cluster when overlay weights change"
+        );
         assert_eq!(
             second_ctx.get_metadata("intelligent_route.session.reused"),
-            Some("true")
+            Some("true"),
+            "the existing affinity binding must be reused"
         );
     }
 
@@ -3163,12 +3168,20 @@ mod tests {
         first.headers.insert("x-session-id", HeaderValue::from_static("sticky"));
         let mut first_ctx = crate::test_utils::make_filter_context(&first);
         let first_action = filter.on_request(&mut first_ctx).await.unwrap();
-        assert!(matches!(first_action, FilterAction::Continue));
+        assert!(
+            matches!(first_action, FilterAction::Continue),
+            "the initial weighted route must continue"
+        );
         assert!(first_ctx.cluster.is_some(), "initial route selects a provider");
-        assert_eq!(first_ctx.get_metadata("intelligent_route.session.bound"), Some("true"));
+        assert_eq!(
+            first_ctx.get_metadata("intelligent_route.session.bound"),
+            Some("true"),
+            "the initial route must create an affinity binding"
+        );
         assert_eq!(
             first_ctx.get_metadata("intelligent_route.session.reused"),
-            Some("false")
+            Some("false"),
+            "the initial route must not report a reused binding"
         );
 
         let dir = tempfile::tempdir().unwrap();
@@ -3177,7 +3190,10 @@ mod tests {
         overlay::handle_overlay_reload(&path, &shared, None);
 
         let serving = shared.load();
-        assert!(serving.candidates.is_empty());
+        assert!(
+            serving.candidates.is_empty(),
+            "the empty overlay must withdraw every candidate"
+        );
 
         let mut bound = crate::test_utils::make_request(Method::POST, "/chat");
         bound.headers.insert("X-Model", HeaderValue::from_static("llama"));
@@ -3213,8 +3229,14 @@ mod tests {
             .insert("X-Model", HeaderValue::from_static("model-a"));
         let mut before_ctx = crate::test_utils::make_filter_context(&before_req);
         let before_action = filter.on_request(&mut before_ctx).await.unwrap();
-        assert!(matches!(before_action, FilterAction::Continue));
-        assert!(before_ctx.cluster.is_some());
+        assert!(
+            matches!(before_action, FilterAction::Continue),
+            "the initial overlay must route requests"
+        );
+        assert!(
+            before_ctx.cluster.is_some(),
+            "the initial overlay must select a provider"
+        );
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("routing-overlay.json");
@@ -3223,15 +3245,27 @@ mod tests {
 
         let serving = shared.load();
         let serving_revision = serving.semantic_revision.as_deref().expect("new envelope revision");
-        assert_ne!(serving_revision, initial_revision);
-        assert!(serving.candidates.is_empty());
+        assert_ne!(
+            serving_revision, initial_revision,
+            "the empty overlay must advance the serving revision"
+        );
+        assert!(
+            serving.candidates.is_empty(),
+            "the new serving revision must withdraw all candidates"
+        );
 
         let mut after_req = crate::test_utils::make_request(Method::POST, "/chat");
         after_req.headers.insert("X-Model", HeaderValue::from_static("model-a"));
         let mut after_ctx = crate::test_utils::make_filter_context(&after_req);
         let after_action = filter.on_request(&mut after_ctx).await.unwrap();
-        assert!(matches!(after_action, FilterAction::Reject(rejection) if rejection.status == 404));
-        assert!(after_ctx.cluster.is_none());
+        assert!(
+            matches!(after_action, FilterAction::Reject(rejection) if rejection.status == 404),
+            "requests after withdrawal must receive 404"
+        );
+        assert!(
+            after_ctx.cluster.is_none(),
+            "withdrawn requests must not select a provider"
+        );
     }
 
     // ---- Overlay revision header ----
