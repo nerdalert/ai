@@ -336,10 +336,13 @@ enum AffinityOutcome<'a> {
 /// overlay's selection mode within the first viable producer-defined group.
 /// Missing group or policy metadata uses deterministic first-admitted ordering.
 /// Praxis AI does not recompute source geography, load, or score.
-/// `weightedRandom` is overlay-only: every candidate must have a selection
-/// group and an integer `traffic_weight` from 1 through 1000. Weights are
-/// applied only among candidates in the first viable group. Inline static
-/// candidates cannot enable weighted selection.
+/// `weightedRandom` is overlay-only: every non-empty weighted candidate list
+/// must supply a selection group and an integer `traffic_weight` from 1 through
+/// 1000. Weights are applied only among candidates in the first viable group.
+/// Inline static candidates cannot enable weighted selection. A validated
+/// versioned overlay may have no candidates in any selection mode; matching
+/// requests are rejected with HTTP 404. Static candidate lists and legacy
+/// flat overlays remain non-empty.
 /// `admission_state=none` is never eligible. `existing_only` is eligible only
 /// through an already-bound session affinity entry.
 ///
@@ -1267,6 +1270,15 @@ mod tests {
         assert!(
             err.to_string().contains("traffic_weight requires overlay mode"),
             "static weights must fail clearly instead of being ignored: {err}"
+        );
+    }
+
+    #[test]
+    fn inline_selection_policy_is_rejected() {
+        let error = parse_err("local_site: site-a\nselection_policy:\n  mode: weightedRandom\ncandidates: []\n");
+        assert!(
+            error.to_string().contains("selection_policy"),
+            "selection policy must be supplied by the overlay: {error}"
         );
     }
 
