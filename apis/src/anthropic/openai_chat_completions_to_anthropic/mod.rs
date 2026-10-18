@@ -20,6 +20,7 @@ use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
     SelectedUpstreamBodyOutcome, parse_filter_config,
 };
+pub(crate) use response::map_stop_reason;
 
 use self::config::OpenaiChatCompletionsToAnthropicConfig;
 
@@ -105,7 +106,8 @@ struct BufferedJsonResponse {
 /// filter converts event chunks incrementally, and OpenAI-compatible response
 /// chunks remain unchanged.
 ///
-/// Anthropic translation requires explicit tenant permission:
+/// Anthropic translation runs only when the filter's `api_translation_enabled`
+/// setting is true, as derived from the tenant's API translation permission.
 ///
 /// ```yaml
 /// filter: openai_chat_completions_to_anthropic
@@ -195,28 +197,34 @@ impl OpenaiChatCompletionsToAnthropicFilter {
 )]
 #[async_trait]
 impl HttpFilter for OpenaiChatCompletionsToAnthropicFilter {
+    /// Return the registry name used by the `ExtProc` filter chain.
     fn name(&self) -> &'static str {
         "openai_chat_completions_to_anthropic"
     }
 
+    /// Defer request-body mutation until `intelligent_route` has selected a provider.
     fn selected_upstream_request_body_access(&self) -> BodyAccess {
         BodyAccess::ReadWrite
     }
 
+    /// Buffer a complete request within the configured cap before JSON translation.
     fn request_body_mode(&self) -> BodyMode {
         BodyMode::StreamBuffer {
             max_bytes: Some(self.config.max_body_bytes),
         }
     }
 
+    /// Allow translation of complete Anthropic JSON responses.
     fn response_body_access(&self) -> BodyAccess {
         BodyAccess::ReadWrite
     }
 
+    /// Receive response chunks while retaining JSON only in this filter's bounded request state.
     fn response_body_mode(&self) -> BodyMode {
         BodyMode::Stream
     }
 
+    /// Validate the selected provider profile and prepare route, credential, and body handling.
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         let profile = match selected_profile(ctx) {
             Ok(profile) => profile,
@@ -246,6 +254,7 @@ impl HttpFilter for OpenaiChatCompletionsToAnthropicFilter {
         Ok(FilterAction::Continue)
     }
 
+    /// Translate the buffered request body after the selected upstream is known.
     async fn on_selected_upstream_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -329,6 +338,7 @@ impl HttpFilter for OpenaiChatCompletionsToAnthropicFilter {
         Ok(SelectedUpstreamBodyOutcome::Continue)
     }
 
+    /// Arm JSON response conversion only for a successful Anthropic Messages response.
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         if ctx.get_metadata(&format!("{BOUND_PREFIX}api_format")) != Some("messages") {
             return Ok(FilterAction::Continue);
@@ -379,6 +389,7 @@ impl HttpFilter for OpenaiChatCompletionsToAnthropicFilter {
         Ok(FilterAction::Continue)
     }
 
+    /// Bound and collect response chunks, then convert the complete JSON document at end of stream.
     fn on_response_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -570,4 +581,11 @@ fn profile_metadata(profile: &SelectedProfile) -> [(&'static str, &str); 10] {
 }
 
 #[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::too_many_lines,
+    reason = "test assertions and request/response exchanges"
+)]
 mod tests;

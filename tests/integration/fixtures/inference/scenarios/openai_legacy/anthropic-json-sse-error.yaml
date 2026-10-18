@@ -61,8 +61,11 @@ turns:
         - message_start
         - content_block_start
         - content_block_delta
+        - content_block_stop
         - message_delta
         - message_stop
+      upstream_sse_repeatable_events:
+        - content_block_delta
   - name: provider-error
     request:
       method: POST

@@ -5,6 +5,17 @@
 
 use serde_json::{Map, Value, json};
 
+/// Map Anthropic terminal reasons to the OpenAI Chat Completions finish reason.
+pub(crate) fn map_stop_reason(stop_reason: &str) -> Result<&'static str, String> {
+    match stop_reason {
+        "end_turn" | "stop_sequence" => Ok("stop"),
+        "tool_use" => Ok("tool_calls"),
+        "max_tokens" => Ok("length"),
+        "refusal" => Ok("content_filter"),
+        other => Err(format!("unsupported Anthropic stop_reason {other:?}")),
+    }
+}
+
 /// Translate one successful Anthropic Messages response.
 #[expect(
     clippy::too_many_lines,
@@ -34,12 +45,7 @@ pub(crate) fn translate_response(bytes: &[u8], client_model: &str) -> Result<Vec
         .get("stop_reason")
         .and_then(Value::as_str)
         .ok_or("Anthropic response requires stop_reason")?;
-    let finish_reason = match stop_reason {
-        "end_turn" | "stop_sequence" => "stop",
-        "tool_use" => "tool_calls",
-        "max_tokens" => "length",
-        other => return Err(format!("unsupported Anthropic stop_reason {other:?}")),
-    };
+    let finish_reason = map_stop_reason(stop_reason)?;
     let usage = object
         .get("usage")
         .and_then(Value::as_object)

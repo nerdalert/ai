@@ -1,9 +1,8 @@
-# OpenAI Chat Completions client to selected ExternalModel provider.
-#
-# `intelligent_route` publishes a trusted per-request provider profile. The
-# translation filter rewrites only Anthropic Messages candidates; an
-# OpenAI-compatible candidate keeps the Chat Completions body and response.
-# The profile is bound to the request before response and SSE processing.
+# OpenAI Chat Completions clients reach the overlay-selected Anthropic Messages
+# or OpenAI-compatible provider. Anthropic JSON and SSE responses are translated
+# to OpenAI format; OpenAI-compatible responses pass through unchanged.
+# `intelligent_route` binds the trusted provider profile to each request before
+# response and SSE processing.
 
 listeners:
   - name: proxy

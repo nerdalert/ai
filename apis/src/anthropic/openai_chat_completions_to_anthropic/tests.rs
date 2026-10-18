@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-#![allow(clippy::unwrap_used, clippy::indexing_slicing, reason = "test assertions")]
-#![allow(clippy::too_many_lines, reason = "tests keep one request/response exchange readable")]
-
 use bytes::Bytes;
 use http::{HeaderValue, StatusCode};
 use praxis_filter::{FilterAction, Response, SelectedUpstreamBodyOutcome};
@@ -82,12 +79,24 @@ fn rejects_conflicting_token_limits_and_invalid_tool_arguments() {
 }
 
 #[test]
-fn tool_choice_none_does_not_expose_tools_to_provider() {
-    let input = br#"{"model":"m","messages":[{"role":"user","content":"hi"}],"max_tokens":8,"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}],"tool_choice":"none"}"#;
+fn tool_choice_none_preserves_tools_for_existing_tool_history() {
+    let input = br#"{"model":"m","messages":[{"role":"assistant","tool_calls":[{"id":"call-1","type":"function","function":{"name":"f","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call-1","content":"done"},{"role":"user","content":"continue"}],"max_tokens":8,"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}],"tool_choice":"none"}"#;
     let (bytes, _) = translate_request(input, "provider-model").unwrap();
     let translated: Value = serde_json::from_slice(&bytes).unwrap();
-    assert!(translated.get("tools").is_none());
-    assert!(translated.get("tool_choice").is_none());
+    assert_eq!(translated["tools"][0]["name"], "f");
+    assert_eq!(translated["tool_choice"], json!({"type":"none"}));
+    assert_eq!(translated["messages"][0]["content"][0]["type"], "tool_use");
+    assert_eq!(translated["messages"][1]["content"][0]["type"], "tool_result");
+    assert_eq!(translated["messages"][1]["content"][0]["tool_use_id"], "call-1");
+}
+
+#[test]
+fn empty_assistant_text_is_omitted_when_tool_calls_are_present() {
+    let input = br#"{"model":"m","messages":[{"role":"assistant","content":"","tool_calls":[{"id":"call-1","type":"function","function":{"name":"f","arguments":"{}"}}]}],"max_tokens":8,"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}]}"#;
+    let (bytes, _) = translate_request(input, "provider-model").unwrap();
+    let translated: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(translated["messages"][0]["content"].as_array().unwrap().len(), 1);
+    assert_eq!(translated["messages"][0]["content"][0]["type"], "tool_use");
 }
 
 #[test]
@@ -105,6 +114,19 @@ fn converts_anthropic_json_tools_usage_and_stop_reason() {
     assert_eq!(translated["choices"][0]["finish_reason"], "tool_calls");
     assert_eq!(translated["usage"]["total_tokens"], 14);
     assert_eq!(translated["usage"]["prompt_tokens_details"]["cached_tokens"], 2);
+}
+
+#[test]
+fn maps_refusal_stop_reason_to_content_filter() {
+    let body = br#"{"type":"message","id":"msg_refusal","role":"assistant","model":"claude","content":[{"type":"text","text":"I cannot help with that request."}],"stop_reason":"refusal","usage":{"input_tokens":4,"output_tokens":6}}"#;
+    let translated: Value =
+        serde_json::from_slice(&response::translate_response(body, "client-model").unwrap()).unwrap();
+    assert_eq!(translated["choices"][0]["finish_reason"], "content_filter");
+    let unsupported = br#"{"type":"message","id":"msg_future","role":"assistant","model":"claude","content":[],"stop_reason":"future_reason","usage":{"input_tokens":4,"output_tokens":0}}"#;
+    assert_eq!(
+        response::translate_response(unsupported, "client-model").unwrap_err(),
+        "unsupported Anthropic stop_reason \"future_reason\""
+    );
 }
 
 #[test]

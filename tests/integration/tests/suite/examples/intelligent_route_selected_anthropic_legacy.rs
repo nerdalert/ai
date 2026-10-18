@@ -17,9 +17,11 @@ const EXAMPLE: &str = "openai-selected-provider-legacy-translation.yaml";
 const OVERLAY_PATH: &str = "/etc/praxis/routing/routing-overlay.json";
 const CREDENTIALS_PATH: &str = "/run/secrets/provider-credentials";
 const ANTHROPIC_EVENTS: &str = concat!(
-    "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_live\",\"usage\":{\"input_tokens\":3}}}\n\n",
+    "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_live\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-test\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
     "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
-    "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"progressive answer\"}}\n\n",
+    "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"progressive \"}}\n\n",
+    "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"answer\"}}\n\n",
+    "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
     "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":4}}\n\n",
     "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
 );
@@ -58,47 +60,107 @@ fn selected_anthropic_and_openai_candidates_keep_distinct_request_profiles() {
     assert_eq!(parse_status(&first), 200, "first selected provider request: {first}");
     assert_eq!(parse_status(&second), 200, "second selected provider request: {second}");
 
-    let first_body = parse_body(&first);
-    let second_body = parse_body(&second);
-    assert!(first_body.contains("anthropic selected") || second_body.contains("anthropic selected"));
-    assert!(first_body.contains("openai passthrough") || second_body.contains("openai passthrough"));
+    let first_body: Value = serde_json::from_str(&parse_body(&first)).expect("first Chat Completions response JSON");
+    let second_body: Value = serde_json::from_str(&parse_body(&second)).expect("second Chat Completions response JSON");
+    let responses = [&first_body, &second_body];
+    let anthropic_response = responses
+        .iter()
+        .find(|body| body["choices"][0]["message"]["content"] == "anthropic selected")
+        .expect("one selected response should contain translated Anthropic text");
+    assert_eq!(
+        anthropic_response["object"], "chat.completion",
+        "Anthropic response must be translated to Chat Completions"
+    );
+    assert_eq!(
+        anthropic_response["choices"][0]["finish_reason"], "stop",
+        "Anthropic end_turn must map to OpenAI stop"
+    );
+    assert_eq!(
+        anthropic_response["usage"]["prompt_tokens"], 3,
+        "Anthropic input usage must map to prompt_tokens"
+    );
+    assert_eq!(
+        anthropic_response["usage"]["completion_tokens"], 2,
+        "Anthropic output usage must map to completion_tokens"
+    );
+    assert_eq!(
+        anthropic_response["usage"]["total_tokens"], 5,
+        "translated usage must include total_tokens"
+    );
+    assert!(
+        anthropic_response.get("type").is_none(),
+        "translated response must not expose Anthropic's top-level type"
+    );
+    let openai_response = responses
+        .iter()
+        .find(|body| body["choices"][0]["message"]["content"] == "openai passthrough")
+        .expect("one selected response should preserve OpenAI-compatible response text");
+    assert_eq!(
+        openai_response["object"], "chat.completion",
+        "OpenAI-compatible response must remain Chat Completions"
+    );
 
     let messages_request = post_request(&anthropic.requests());
-    assert_eq!(messages_request.uri, "/v1/messages");
+    assert_eq!(
+        messages_request.uri, "/v1/messages",
+        "Anthropic selection must use Messages path"
+    );
     let messages_body: Value = serde_json::from_str(&messages_request.body).expect("translated Messages JSON");
-    assert_eq!(messages_body["model"], "claude-target");
-    assert_eq!(messages_body["messages"][0]["content"][0]["text"], "hi");
+    assert_eq!(
+        messages_body["model"], "claude-target",
+        "Anthropic request must use selected target model"
+    );
+    assert_eq!(
+        messages_body["messages"][0]["content"][0]["text"], "hi",
+        "Anthropic request must translate client text"
+    );
     assert!(
         messages_request
             .headers
             .to_ascii_lowercase()
-            .contains("x-api-key: anthropic-test-key")
+            .contains("x-api-key: anthropic-test-key"),
+        "Anthropic upstream must receive the selected API key"
     );
     assert!(
         !messages_request
             .headers
             .to_ascii_lowercase()
-            .contains("authorization: bearer caller-key")
+            .contains("authorization: bearer caller-key"),
+        "Anthropic upstream must not receive the caller Authorization credential"
     );
     assert!(
         !messages_request
             .headers
             .to_ascii_lowercase()
-            .contains("x-api-key: caller-key")
+            .contains("x-api-key: caller-key"),
+        "Anthropic upstream must not receive the caller API key"
     );
 
     let openai_request = post_request(&openai.requests());
-    assert_eq!(openai_request.uri, "/v1/chat/completions");
+    assert_eq!(
+        openai_request.uri, "/v1/chat/completions",
+        "OpenAI selection must preserve the Chat Completions path"
+    );
     let openai_body: Value = serde_json::from_str(&openai_request.body).expect("pass-through Chat Completions JSON");
-    assert_eq!(openai_body["model"], "gpt-target");
-    assert_eq!(openai_body["messages"][0]["content"], "hi");
+    assert_eq!(
+        openai_body["model"], "gpt-target",
+        "OpenAI request must use selected target model"
+    );
+    assert_eq!(
+        openai_body["messages"][0]["content"], "hi",
+        "OpenAI passthrough must preserve client messages"
+    );
     assert!(
         openai_request
             .headers
             .to_ascii_lowercase()
-            .contains("authorization: bearer openai-test-token")
+            .contains("authorization: bearer openai-test-token"),
+        "OpenAI upstream must receive the selected bearer credential"
     );
-    assert!(!openai_request.body.contains("openai-test-token"));
+    assert!(
+        !openai_request.body.contains("openai-test-token"),
+        "OpenAI credential must not be copied into the body"
+    );
 }
 
 #[test]
@@ -129,12 +191,13 @@ fn selected_anthropic_sse_is_converted_incrementally_to_openai_sse() {
     assert!(
         response
             .to_ascii_lowercase()
-            .contains("content-type: text/event-stream")
+            .contains("content-type: text/event-stream"),
+        "translated OpenAI response must retain SSE content type"
     );
     let body = parse_body(&response);
     assert!(
-        body.contains("progressive answer"),
-        "translated stream must carry text: {body}"
+        body.contains("progressive ") && body.contains("answer"),
+        "translated stream must preserve both Anthropic text deltas: {body}"
     );
     assert!(
         body.contains("chat.completion.chunk"),
@@ -145,11 +208,18 @@ fn selected_anthropic_sse_is_converted_incrementally_to_openai_sse() {
         "translated stream must terminate: {body}"
     );
     let upstream = post_request(&backend.requests());
-    assert_eq!(upstream.uri, "/v1/messages");
+    assert_eq!(
+        upstream.uri, "/v1/messages",
+        "streaming Anthropic selection must use Messages path"
+    );
     let upstream_body: Value = serde_json::from_str(&upstream.body).expect("Anthropic streaming request JSON");
-    assert_eq!(upstream_body["stream"], true);
+    assert_eq!(
+        upstream_body["stream"], true,
+        "streaming client request must enable Anthropic streaming"
+    );
 }
 
+/// Render the checked-in example with isolated test listener and credential paths.
 fn example_yaml(
     listener_port: u16,
     overlay_path: &Path,
@@ -170,6 +240,7 @@ fn example_yaml(
         .replace("127.0.0.1:8002", &format!("127.0.0.1:{openai_port}"))
 }
 
+/// Build a signed overlay that selects Anthropic alone or Anthropic and OpenAI candidates.
 fn provider_overlay(anthropic_only: bool) -> String {
     let mut candidates = vec![json!({
         "kind":"inference_model", "name":"client-model", "site":"site-a", "cluster":"anthropic-backend",
@@ -190,12 +261,14 @@ fn provider_overlay(anthropic_only: bool) -> String {
     provider_overlay_envelope(&overlay, &digest)
 }
 
+/// Construct the semantic overlay body used by the selection test.
 fn provider_overlay_body(candidates: &[Value]) -> Value {
     json!({
         "network":"grid-demo", "local_site":"site-a", "selection_policy":{"mode":"roundRobin"}, "candidates":candidates
     })
 }
 
+/// Compute the producer-compatible digest over the overlay's semantic fields.
 fn provider_overlay_digest(overlay: &Value) -> String {
     let semantic = json!({
         "network":overlay["network"], "local_site":overlay["local_site"],
@@ -206,6 +279,7 @@ fn provider_overlay_digest(overlay: &Value) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
 }
 
+/// Wrap the semantic overlay and digest in the required versioned envelope.
 fn provider_overlay_envelope(overlay: &Value, digest: &str) -> String {
     let envelope = json!({
         "schema_version":"1.0.0",
@@ -218,12 +292,14 @@ fn provider_overlay_envelope(overlay: &Value, digest: &str) -> String {
     serde_json::to_string(&envelope).expect("serialize overlay envelope")
 }
 
+/// Create a temporary projected credential file for one provider binding.
 fn mount_secret(base: &Path, namespace: &str, name: &str, key: &str, token: &str) {
     let directory = base.join(namespace).join(name);
     std::fs::create_dir_all(&directory).expect("create projected Secret directory");
     std::fs::write(directory.join(key), token).expect("write synthetic projected Secret");
 }
 
+/// Build an OpenAI Chat Completions request with dummy caller credentials.
 fn chat_request(stream: bool) -> String {
     let body = json!({
         "model":"client-model", "messages":[{"role":"user","content":"hi"}],
@@ -237,6 +313,7 @@ fn chat_request(stream: bool) -> String {
     )
 }
 
+/// Extract the recorded provider POST or report the methods observed instead.
 fn post_request(requests: &[CapturedRequest]) -> CapturedRequest {
     let Some(request) = requests.iter().find(|request| request.method == "POST") else {
         let methods = requests

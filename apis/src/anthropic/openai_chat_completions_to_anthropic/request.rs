@@ -101,18 +101,17 @@ pub(crate) fn translate_request(bytes: &[u8], target_model: &str) -> Result<(Vec
     }
     let tools = object.remove("tools");
     let tool_choice = object.remove("tool_choice");
-    let disable_tools = matches!(tool_choice.as_ref().and_then(Value::as_str), Some("none"));
     match tools {
         Some(Value::Array(tools)) => {
             let translated = translate_tools(&tools)?;
-            if !translated.is_empty() && !disable_tools {
+            if !translated.is_empty() {
                 output.insert("tools".to_owned(), Value::Array(translated));
-                if let Some(choice) = tool_choice
-                    && let Some(choice) = translate_tool_choice(&choice)?
+                if let Some(choice) = tool_choice.as_ref()
+                    && let Some(choice) = translate_tool_choice(choice)?
                 {
                     output.insert("tool_choice".to_owned(), choice);
                 }
-            } else if tool_choice.is_some() && !disable_tools {
+            } else if tool_choice.as_ref().is_some_and(|choice| !is_tool_choice_none(choice)) {
                 return Err("tool_choice cannot be set when tools is empty".to_owned());
             }
         },
@@ -211,7 +210,11 @@ fn translate_messages(value: &Value) -> Result<(Vec<Value>, Option<String>), Str
             "user" => output.push(json!({"role":"user","content": translate_content(object.get("content"))?})),
             "assistant" => {
                 let mut content = Vec::new();
-                if let Some(value) = object.get("content").filter(|value| !value.is_null()) {
+                let has_tool_calls = object.contains_key("tool_calls");
+                if let Some(value) = object
+                    .get("content")
+                    .filter(|value| !(value.is_null() || has_tool_calls && value.as_str().is_some_and(str::is_empty)))
+                {
                     content.extend(translate_content(Some(value))?);
                 }
                 if let Some(calls) = object.get("tool_calls") {
@@ -374,7 +377,7 @@ fn translate_tool_choice(value: &Value) -> Result<Option<Value>, String> {
         return match choice {
             "auto" => Ok(Some(json!({"type":"auto"}))),
             "required" => Ok(Some(json!({"type":"any"}))),
-            "none" => Ok(None),
+            "none" => Ok(Some(json!({"type":"none"}))),
             other => Err(format!("unsupported tool_choice value {other:?}")),
         };
     }
@@ -396,6 +399,11 @@ fn translate_tool_choice(value: &Value) -> Result<Option<Value>, String> {
         Some(kind) => Err(format!("unsupported tool_choice type {kind:?}")),
         None => Err("tool_choice function object requires type".to_owned()),
     }
+}
+
+/// Identify OpenAI's no-tools choice, which does not require translated tools.
+fn is_tool_choice_none(value: &Value) -> bool {
+    value.as_str() == Some("none")
 }
 
 /// Normalize one or more OpenAI stop strings to Anthropic's sequence array.

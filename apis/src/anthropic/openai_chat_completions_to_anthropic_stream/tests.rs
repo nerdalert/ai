@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-#![allow(clippy::unwrap_used, clippy::indexing_slicing, reason = "test assertions")]
-#![allow(clippy::too_many_lines, reason = "tests keep one streamed response readable")]
-
 use bytes::Bytes;
 use http::{HeaderValue, StatusCode};
 use praxis_filter::{FilterAction, HttpFilter, Response};
@@ -61,6 +58,29 @@ async fn converts_anthropic_sse_incrementally_and_emits_openai_termination_and_u
     assert!(output.contains("\"model\":\"client-model\""));
     assert!(output.contains("\"prompt_tokens\":3"));
     assert!(output.contains("\"completion_tokens\":2"));
+    assert!(output.contains("data: [DONE]"));
+}
+
+#[tokio::test]
+async fn maps_refusal_stop_reason_to_content_filter_finish_reason() {
+    let filter = filter("{}");
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+    let mut response = sse_response();
+    let mut ctx = crate::test_utils::make_filter_context(&request);
+    arm(&mut ctx, true);
+    ctx.response_header = Some(&mut response);
+    assert!(matches!(
+        filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let events = EVENTS.replace("end_turn", "refusal");
+    let mut body = Some(Bytes::from(events));
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, true).unwrap(),
+        FilterAction::Continue
+    ));
+    let output = std::str::from_utf8(body.as_ref().unwrap()).unwrap();
+    assert!(output.contains("\"finish_reason\":\"content_filter\""));
     assert!(output.contains("data: [DONE]"));
 }
 

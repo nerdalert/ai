@@ -508,16 +508,19 @@ fn validate_replay_literal_credentials(mapping: &serde_yaml::Mapping) -> Result<
 /// Allows only inline dummy credentials in the replay-owned provider filter.
 fn has_literal_provider_credentials(config: &serde_yaml::Mapping) -> bool {
     config
-        .get("credentials")
-        .and_then(serde_yaml::Value::as_sequence)
-        .filter(|credentials| !credentials.is_empty())
-        .is_some_and(|credentials| {
-            credentials.iter().all(|credential| {
-                credential.get("value").and_then(serde_yaml::Value::as_str).is_some()
-                    && credential.get("env_var").is_none_or(serde_yaml::Value::is_null)
-                    && credential.get("file").is_none_or(serde_yaml::Value::is_null)
+        .get("projected_credential_mount_base")
+        .is_none_or(serde_yaml::Value::is_null)
+        && config
+            .get("credentials")
+            .and_then(serde_yaml::Value::as_sequence)
+            .filter(|credentials| !credentials.is_empty())
+            .is_some_and(|credentials| {
+                credentials.iter().all(|credential| {
+                    credential.get("value").and_then(serde_yaml::Value::as_str).is_some()
+                        && credential.get("env_var").is_none_or(serde_yaml::Value::is_null)
+                        && credential.get("file").is_none_or(serde_yaml::Value::is_null)
+                })
             })
-        })
 }
 
 /// Rejects `openai_mcp_tool_resolve` fixtures whose requests would eager-list.
@@ -769,7 +772,15 @@ fn fixture_overlay_path() -> PathBuf {
 
 /// Replace the fixture-only relative path with its canonical repository path.
 fn patch_fixture_overlay_path(source: &str) -> Result<String, FixtureError> {
-    let path = fixture_overlay_path()
+    patch_overlay_path(source, &fixture_overlay_path())
+}
+
+/// Replace the fixture overlay path only for configs that reference it.
+fn patch_overlay_path(source: &str, overlay_path: &Path) -> Result<String, FixtureError> {
+    if !source.contains(FIXTURE_OVERLAY_RELATIVE_PATH) {
+        return Ok(source.to_owned());
+    }
+    let path = overlay_path
         .canonicalize()
         .map_err(|_source| runtime_error("provider-aware fixture overlay could not be resolved"))?;
     let path = path
@@ -778,7 +789,7 @@ fn patch_fixture_overlay_path(source: &str) -> Result<String, FixtureError> {
     // The recorder preflight returns a config with the relative fixture path
     // already expanded. Avoid expanding the suffix inside that absolute path
     // a second time when the config is patched for replay.
-    if source.contains(path) || !source.contains(FIXTURE_OVERLAY_RELATIVE_PATH) {
+    if source.contains(path) {
         return Ok(source.to_owned());
     }
     Ok(source.replace(FIXTURE_OVERLAY_RELATIVE_PATH, path))
@@ -1938,12 +1949,13 @@ mod tests {
             sanitize::RedactionRules,
         },
         ScenarioRunner, ScriptedHttpServer, SseEventMembership, build_replay_config, build_replay_config_with_aliases,
-        compare_imported_requests, config_contains_endpoint_address, finish_backend_after_proxy_shutdown,
-        fixture_comparison_value, has_only_normal_relative_components, is_network_value_key,
-        is_replay_contained_filter, load_and_validate_config_source, resolve_example_config_path,
-        send_recorded_request, validate_endpoint_collection, validate_generic_network_string,
-        validate_network_string_with_context, validate_replay_filters, validate_replay_network_value,
-        validate_scenario_requests, validate_singular_endpoint, validate_sse_events, validate_upstream_inputs,
+        compare_imported_requests, config_contains_endpoint_address, contain_replay_external_resources,
+        finish_backend_after_proxy_shutdown, fixture_comparison_value, has_only_normal_relative_components,
+        is_network_value_key, is_replay_contained_filter, load_and_validate_config_source, patch_overlay_path,
+        resolve_example_config_path, send_recorded_request, validate_endpoint_collection,
+        validate_generic_network_string, validate_network_string_with_context, validate_replay_filters,
+        validate_replay_network_value, validate_scenario_requests, validate_singular_endpoint, validate_sse_events,
+        validate_upstream_inputs,
     };
     use crate::{example_config_path, free_port_guard, proxy::blocked_proxy_guard_for_test};
 
@@ -1952,10 +1964,51 @@ mod tests {
         let source = std::fs::read_to_string(example_config_path("openai-selected-provider-legacy-fixture.yaml"))
             .expect("selected-provider fixture example should exist");
         let patched = super::patch_fixture_overlay_path(&source).expect("checked-in fixture overlay should resolve");
-        let contained = super::contain_replay_external_resources(&patched)
+        let contained = contain_replay_external_resources(&patched)
             .expect("fixture replay should admit only its canonical routing profile");
         let config = Config::from_yaml(&contained).expect("fixture example should parse");
         validate_replay_filters(&config).expect("fixture filters should be replay-contained");
+    }
+
+    #[test]
+    fn replay_rejects_provider_host_mount_even_with_literal_credentials() {
+        let source = concat!(
+            "filter_chains:\n",
+            "  - name: replay\n",
+            "    filters:\n",
+            "      - filter: credential_inject\n",
+            "        credentials:\n",
+            "          - name: provider-key\n",
+            "            namespace: fixture\n",
+            "            key: api-key\n",
+            "            strategy: apikey\n",
+            "            header: x-api-key\n",
+            "            value: fixture-only-dummy-token\n",
+            "        projected_credential_mount_base: /host/run/secrets/provider-credentials\n"
+        );
+        let error = contain_replay_external_resources(source)
+            .expect_err("replay must not retain a host path for fallback provider credentials");
+        assert_eq!(
+            error.to_string(),
+            "scenario provider credentials are not replay-contained"
+        );
+        let null_mount = source.replace(
+            "projected_credential_mount_base: /host/run/secrets/provider-credentials",
+            "projected_credential_mount_base: null",
+        );
+        contain_replay_external_resources(&null_mount)
+            .expect("a null mount base cannot read a host secret and stays replay-contained");
+    }
+
+    #[test]
+    fn unrelated_replay_config_does_not_resolve_fixture_overlay() {
+        let source = "filter_chains: []\n";
+        let missing_overlay = Path::new("/path/that/does/not/exist/openai-to-anthropic.json");
+        assert_eq!(
+            patch_overlay_path(source, missing_overlay).unwrap(),
+            source,
+            "configs without the fixture overlay must not depend on its file"
+        );
     }
 
     #[test]

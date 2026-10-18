@@ -269,7 +269,7 @@ impl RecordingProxyGuard {
             return Err(runtime_error("recording proxy exceeded its expected request count"));
         }
         if state.attempts.len() != expected_exchanges {
-            return Err(runtime_error("recording proxy captured an unexpected request count"));
+            return Err(FixtureError::UnexpectedRecordingRequestCount);
         }
         if state
             .attempts
@@ -436,13 +436,11 @@ pub(super) async fn record_live(
     let captured = recorder.finish_captures(attempts);
     proxy_result?;
     let captured = match captured {
-        Err(FixtureError::ReplayRuntime {
-            message: "recording proxy captured an unexpected request count",
-        }) => {
+        Err(FixtureError::UnexpectedRecordingRequestCount) => {
             if let Some(error) = operation_error {
                 return Err(error);
             }
-            return Err(runtime_error("recording proxy captured an unexpected request count"));
+            return Err(FixtureError::UnexpectedRecordingRequestCount);
         },
         Err(error) => return Err(error),
         Ok(captured) => {
@@ -3330,6 +3328,27 @@ mod tests {
         let serialized = serde_json::to_string(&fixture).unwrap();
         assert!(!serialized.contains(SECRET_SENTINEL));
         super::super::validate_commit_safe(&fixture).unwrap();
+        provider.finish().await;
+    }
+
+    #[tokio::test]
+    async fn record_live_preserves_unexpected_client_status_error() {
+        let provider = LocalProvider::start(handler(|_request| async move { chat_response(0) })).await;
+        let mut scenario = live_scenario();
+        scenario.turns.truncate(1);
+        scenario.turns[0].expect.client_status = 201;
+
+        let error = ScenarioRunner::record_live(&scenario, target(provider.http_url("/"), secret_headers()))
+            .await
+            .expect_err("recording must report the declared/observed client-status mismatch");
+
+        assert!(matches!(
+            error,
+            FixtureError::UnexpectedRecordedClientStatus {
+                actual: 200,
+                expected: 201
+            }
+        ));
         provider.finish().await;
     }
 

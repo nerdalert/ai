@@ -11,7 +11,7 @@ The trusted profile is emitted by `intelligent_route`, never inferred from a req
 
 For Anthropic candidates, non-streaming JSON response chunks are retained in bounded request-local state until they can be translated. The separate SSE filter converts event chunks incrementally, and OpenAI-compatible response chunks remain unchanged.
 
-Anthropic translation requires explicit tenant permission:
+Anthropic translation runs only when the filter's `api_translation_enabled` setting is true, as derived from the tenant's API translation permission.
 
 Only Chat Completions fields represented by Anthropic Messages are accepted. Unsupported fields and modalities fail with a 400 response.
 

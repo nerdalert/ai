@@ -1371,14 +1371,10 @@ fn record_route_decision(
     ctx.set_metadata(ROUTE_NAME, &*candidate.name);
     ctx.set_metadata(ROUTE_SITE, &*candidate.site);
     ctx.set_metadata(ROUTE_STABLE_ID, &*candidate.stable_id);
-    if let Some(api_format) = &candidate.api_format {
-        ctx.set_metadata(ROUTE_API_FORMAT, api_format.as_ref());
-    }
-    if let Some(path) = &candidate.path {
-        ctx.set_metadata(ROUTE_PATH, path.as_ref());
-    }
-    if let Some(target_model) = &candidate.target_model {
-        ctx.set_metadata(ROUTE_TARGET_MODEL, target_model.as_ref());
+    if let Some(profile) = &candidate.provider_profile {
+        ctx.set_metadata(ROUTE_API_FORMAT, profile.api_format.as_str());
+        ctx.set_metadata(ROUTE_PATH, profile.path.as_ref());
+        ctx.set_metadata(ROUTE_TARGET_MODEL, profile.target_model.as_ref());
     }
     if let Some(revision) = semantic_revision {
         ctx.set_metadata(ROUTE_OVERLAY_REVISION, revision.as_ref());
@@ -4445,9 +4441,7 @@ mod tests {
                 selection_tier: None,
                 site: Arc::from("s"),
                 stable_id: descriptor::default_stable_id(CapabilityKind::InferenceModel, "llama", "s", cluster),
-                api_format: None,
-                path: None,
-                target_model: None,
+                provider_profile: None,
             });
         }
         RouteSnapshot::from_static(route_candidates, Arc::from("site-a"))

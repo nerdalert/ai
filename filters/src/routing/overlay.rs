@@ -32,7 +32,9 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    descriptor::{self, AdmissionState, CandidateConfig, CapabilityKind, RouteCandidate},
+    descriptor::{
+        self, AdmissionState, CandidateConfig, CapabilityKind, ProviderApiFormat, ProviderProfile, RouteCandidate,
+    },
     group_index::{self, GroupIndex},
     metadata::{CandidateCredential, CredentialRef},
     metrics::{self, ReloadResult},
@@ -901,25 +903,13 @@ fn enrich_provider_profile(
         return Err(format!("routing: candidate {index}: provider profile requires stable_id").into());
     }
     let profile = ProviderProfile {
-        api_format,
-        path,
-        target_model,
+        api_format: validate_provider_api_format(index, api_format)?,
+        path: Arc::from(path),
+        target_model: Arc::from(target_model),
     };
     validate_provider_profile(index, candidate.kind, candidate.credential.as_ref(), &profile)?;
-    candidate.api_format = Some(Arc::from(api_format));
-    candidate.path = Some(Arc::from(path));
-    candidate.target_model = Some(Arc::from(target_model));
+    candidate.provider_profile = Some(profile);
     Ok(())
-}
-
-/// Borrowed fields that must be validated as one provider profile.
-struct ProviderProfile<'a> {
-    /// Request API dialect selected by the provider binding.
-    api_format: &'a str,
-    /// Upstream request path selected by the provider binding.
-    path: &'a str,
-    /// Upstream model name selected by the provider binding.
-    target_model: &'a str,
 }
 
 /// Reject incomplete, unsupported, or unsafe provider profiles before a new
@@ -928,12 +918,11 @@ fn validate_provider_profile(
     index: usize,
     kind: CapabilityKind,
     credential: Option<&CandidateCredential>,
-    profile: &ProviderProfile<'_>,
+    profile: &ProviderProfile,
 ) -> Result<(), FilterError> {
     validate_provider_kind(index, kind)?;
-    validate_provider_api_format(index, profile.api_format)?;
-    validate_provider_path(index, profile.path)?;
-    validate_provider_target_model(index, profile.target_model)?;
+    validate_provider_path(index, &profile.path)?;
+    validate_provider_target_model(index, &profile.target_model)?;
     validate_provider_credential(index, profile.api_format, credential)
 }
 
@@ -946,11 +935,12 @@ fn validate_provider_kind(index: usize, kind: CapabilityKind) -> Result<(), Filt
 }
 
 /// Ensure the provider dialect is one the translation dispatcher understands.
-fn validate_provider_api_format(index: usize, api_format: &str) -> Result<(), FilterError> {
-    if !matches!(api_format, "openai-chat" | "messages") {
-        return Err(format!("routing: candidate {index}: unsupported api_format {api_format:?}").into());
+fn validate_provider_api_format(index: usize, api_format: &str) -> Result<ProviderApiFormat, FilterError> {
+    match api_format {
+        "openai-chat" => Ok(ProviderApiFormat::OpenAiChat),
+        "messages" => Ok(ProviderApiFormat::Messages),
+        other => Err(format!("routing: candidate {index}: unsupported api_format {other:?}").into()),
     }
-    Ok(())
 }
 
 /// Ensure the provider request target is a safe absolute path without a query.
@@ -982,10 +972,10 @@ fn validate_provider_target_model(index: usize, target_model: &str) -> Result<()
 /// Require an API-key Secret reference for Anthropic Messages providers.
 fn validate_provider_credential(
     index: usize,
-    api_format: &str,
+    api_format: ProviderApiFormat,
     credential: Option<&CandidateCredential>,
 ) -> Result<(), FilterError> {
-    if api_format == "messages" && credential.is_none_or(|value| value.strategy != "apikey") {
+    if api_format == ProviderApiFormat::Messages && credential.is_none_or(|value| value.strategy != "apikey") {
         return Err(format!(
             "routing: candidate {index}: messages provider profile requires an apikey credential reference"
         )
@@ -2368,6 +2358,72 @@ mod tests {
             "overlay": overlay_obj
         }))
         .unwrap()
+    }
+
+    /// Create a content-addressed overlay with an optional provider profile.
+    fn make_provider_profile_overlay(
+        api_format: Option<&str>,
+        path: Option<&str>,
+        target_model: Option<&str>,
+    ) -> String {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&make_envelope_json("site-a", "m", "provider", "net")).unwrap();
+        let candidate = &mut value["overlay"]["candidates"][0];
+        candidate["stable_id"] = serde_json::json!("model/provider-a");
+        if let Some(api_format) = api_format {
+            candidate["api_format"] = serde_json::json!(api_format);
+        }
+        if let Some(path) = path {
+            candidate["path"] = serde_json::json!(path);
+        }
+        if let Some(target_model) = target_model {
+            candidate["target_model"] = serde_json::json!(target_model);
+        }
+        if api_format == Some("messages") {
+            candidate["credential"] = serde_json::json!({
+                "strategy":"apikey",
+                "secretRef":{"name":"provider-key","namespace":"ns","key":"api-key"}
+            });
+        }
+        let digest = compute_semantic_digest(&value["overlay"]).unwrap();
+        value["revision"]["value"] = serde_json::json!(digest);
+        value["content_digest"]["value"] = value["revision"]["value"].clone();
+        serde_json::to_string(&value).unwrap()
+    }
+
+    #[test]
+    fn provider_profile_is_complete_or_absent_and_rejects_malformed_values() {
+        let complete = make_provider_profile_overlay(Some("messages"), Some("/v1/messages"), Some("claude-test"));
+        let snapshot = RouteSnapshot::from_overlay(complete.as_bytes()).unwrap();
+        let profile = snapshot.candidates[0]
+            .provider_profile
+            .as_ref()
+            .expect("complete trusted profile should be retained");
+        assert_eq!(profile.api_format, ProviderApiFormat::Messages);
+        assert_eq!(profile.path.as_ref(), "/v1/messages");
+        assert_eq!(profile.target_model.as_ref(), "claude-test");
+
+        let absent = make_provider_profile_overlay(None, None, None);
+        let snapshot = RouteSnapshot::from_overlay(absent.as_bytes()).unwrap();
+        assert!(snapshot.candidates[0].provider_profile.is_none());
+
+        for (malformed, expected_error) in [
+            (
+                make_provider_profile_overlay(Some("messages"), Some("/v1/messages"), None),
+                "api_format, path, and target_model must be supplied together",
+            ),
+            (
+                make_provider_profile_overlay(Some("custom-format"), Some("/v1/messages"), Some("claude-test")),
+                "unsupported api_format",
+            ),
+        ] {
+            let error = RouteSnapshot::from_overlay(malformed.as_bytes())
+                .expect_err("partial and unknown provider profiles must be rejected");
+            assert!(
+                error.to_string().contains(expected_error),
+                "unexpected validation error: {error}"
+            );
+        }
     }
 
     fn make_empty_envelope_json(local_site: &str, network: &str) -> String {

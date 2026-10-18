@@ -231,14 +231,38 @@ pub(crate) struct RouteCandidate {
     /// Deterministic identifier for session affinity binding.
     pub stable_id: Arc<str>,
 
-    /// Provider API format from a trusted, versioned overlay.
-    pub api_format: Option<Arc<str>>,
+    /// Complete provider routing profile from a trusted, versioned overlay.
+    pub provider_profile: Option<ProviderProfile>,
+}
 
-    /// Provider request path from the same selected overlay candidate.
-    pub path: Option<Arc<str>>,
+/// API dialect for a trusted provider route profile.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProviderApiFormat {
+    /// OpenAI Chat Completions-compatible provider.
+    OpenAiChat,
+    /// Anthropic Messages provider.
+    Messages,
+}
 
-    /// Provider target model from the same selected overlay candidate.
-    pub target_model: Option<Arc<str>>,
+impl ProviderApiFormat {
+    /// Return the stable external metadata spelling.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAiChat => "openai-chat",
+            Self::Messages => "messages",
+        }
+    }
+}
+
+/// Fields that must be selected and validated as one provider route profile.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProviderProfile {
+    /// Provider request dialect.
+    pub api_format: ProviderApiFormat,
+    /// Provider request path.
+    pub path: Arc<str>,
+    /// Provider target model name.
+    pub target_model: Arc<str>,
 }
 
 // -----------------------------------------------------------------------------
@@ -328,9 +352,7 @@ fn validate_candidates_with_empty(
             selection_tier: None,
             site: Arc::from(c.site.as_str()),
             stable_id,
-            api_format: None,
-            path: None,
-            target_model: None,
+            provider_profile: None,
         });
     }
 

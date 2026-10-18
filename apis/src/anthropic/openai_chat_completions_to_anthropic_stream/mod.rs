@@ -17,7 +17,9 @@ use serde_json::{Value, json};
 use tracing::warn;
 
 use self::config::OpenaiChatCompletionsToAnthropicStreamConfig;
-use super::openai_chat_completions_to_anthropic::{BOUND_PREFIX, CLIENT_MODEL, INCLUDE_USAGE, REQUEST_STREAM};
+use super::openai_chat_completions_to_anthropic::{
+    BOUND_PREFIX, CLIENT_MODEL, INCLUDE_USAGE, REQUEST_STREAM, map_stop_reason,
+};
 
 /// Registered filter identifier.
 const FILTER_NAME: &str = "openai_chat_completions_to_anthropic_stream";
@@ -306,12 +308,7 @@ impl OpenaiChatCompletionsToAnthropicStreamFilter {
             .get("stop_reason")
             .and_then(Value::as_str)
             .ok_or("Anthropic message_delta requires stop_reason")?;
-        let finish_reason = match reason {
-            "end_turn" | "stop_sequence" => "stop",
-            "tool_use" => "tool_calls",
-            "max_tokens" => "length",
-            other => return Err(format!("unsupported Anthropic stop_reason {other:?}")),
-        };
+        let finish_reason = map_stop_reason(reason)?;
         let usage = value
             .get("usage")
             .and_then(Value::as_object)
@@ -347,30 +344,37 @@ impl OpenaiChatCompletionsToAnthropicStreamFilter {
 )]
 #[async_trait]
 impl HttpFilter for OpenaiChatCompletionsToAnthropicStreamFilter {
+    /// Return the registry name used by the `ExtProc` filter chain.
     fn name(&self) -> &'static str {
         "openai_chat_completions_to_anthropic_stream"
     }
 
+    /// Leave request bodies to the JSON translator or selected OpenAI pass-through path.
     fn request_body_access(&self) -> BodyAccess {
         BodyAccess::None
     }
 
+    /// Do not buffer the request in this response-only filter.
     fn request_body_mode(&self) -> BodyMode {
         BodyMode::Stream
     }
 
+    /// Allow incremental conversion of the selected Anthropic response stream.
     fn response_body_access(&self) -> BodyAccess {
         BodyAccess::ReadWrite
     }
 
+    /// Keep upstream SSE progressive; only the unfinished event is retained.
     fn response_body_mode(&self) -> BodyMode {
         BodyMode::Stream
     }
 
+    /// This filter has no request-side action; selection happens in the JSON filter.
     async fn on_request(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         Ok(FilterAction::Continue)
     }
 
+    /// Arm conversion only when the bound provider is Anthropic and the client requested streaming.
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         if ctx.get_metadata(&format!("{BOUND_PREFIX}api_format")) != Some("messages")
             || ctx.get_metadata(REQUEST_STREAM) != Some("true")
@@ -420,6 +424,7 @@ impl HttpFilter for OpenaiChatCompletionsToAnthropicStreamFilter {
         Ok(FilterAction::Continue)
     }
 
+    /// Decode complete SSE events from chunks and emit equivalent OpenAI chunks immediately.
     #[expect(
         clippy::too_many_lines,
         reason = "This callback bounds and transforms each SSE body chunk in place"
@@ -521,4 +526,11 @@ fn append_done(output: &mut BytesMut) -> Result<(), FilterError> {
 }
 
 #[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::too_many_lines,
+    reason = "test assertions and streamed response exchanges"
+)]
 mod tests;

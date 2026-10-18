@@ -64,7 +64,7 @@ for how these are authored and regenerated.
 | [nemo-guardrails-response.yaml](configs/nemo-guardrails-response.yaml) | Evaluates upstream responses against a NeMo Guardrails service |
 | [nemo-guardrails.yaml](configs/nemo-guardrails.yaml) | Evaluates incoming requests against a NeMo Guardrails service |
 | [openai-selected-provider-legacy-fixture.yaml](configs/openai-selected-provider-legacy-fixture.yaml) | Controlled inference-fixture replay for OpenAI Chat Completions to an Anthropic Messages provider |
-| [openai-selected-provider-legacy-translation.yaml](configs/openai-selected-provider-legacy-translation.yaml) | `intelligent_route` publishes a trusted per-request provider profile |
+| [openai-selected-provider-legacy-translation.yaml](configs/openai-selected-provider-legacy-translation.yaml) | OpenAI Chat Completions clients reach the overlay-selected Anthropic Messages or OpenAI-compatible provider |
 | [project-state-owner-headers.yaml](configs/project-state-owner-headers.yaml) | Demonstrates the production boundary used when an external authenticator injects separate tenant and subject headers. `state_owner` consumes those assertions into an immutable internal owner and strips the inbound copies. `project_state_owner_headers` then recreates destination-specific headers from that normalized context |
 | [prompt-enrichment.yaml](configs/prompt-enrichment.yaml) | Injects system messages into OpenAI-compatible chat completion requests before forwarding to the upstream provider |
 | [provider-route.yaml](configs/provider-route.yaml) | This listener requires downstream mTLS. `peer_identity_trust` authenticates and authorizes the edge gateway before AI-owned x-ai-routing-* fields can influence provider-local routing |

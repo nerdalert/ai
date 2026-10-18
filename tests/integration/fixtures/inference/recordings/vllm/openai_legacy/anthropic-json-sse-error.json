@@ -186,7 +186,13 @@
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"content\":\"progressive hello\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-recorded-0003\",\"model\":\"fixture-openai-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"content\":\"progressive \"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-recorded-0003\",\"model\":\"fixture-openai-model\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-recorded-0003\",\"model\":\"fixture-openai-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
@@ -251,7 +257,7 @@
             "frames": [
               {
                 "event": "message_start",
-                "data": "{\"message\":{\"id\":\"msg_recorded_0004\",\"usage\":{\"input_tokens\":3}},\"type\":\"message_start\"}",
+                "data": "{\"message\":{\"content\":[],\"id\":\"msg_recorded_0004\",\"model\":\"claude-fixture-model\",\"role\":\"assistant\",\"stop_reason\":null,\"stop_sequence\":null,\"type\":\"message\",\"usage\":{\"input_tokens\":3,\"output_tokens\":0}},\"type\":\"message_start\"}",
                 "id": null,
                 "retry": null
               },
@@ -263,7 +269,19 @@
               },
               {
                 "event": "content_block_delta",
-                "data": "{\"delta\":{\"text\":\"progressive hello\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "data": "{\"delta\":{\"text\":\"progressive \",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_delta",
+                "data": "{\"delta\":{\"text\":\"hello\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_stop",
+                "data": "{\"index\":0,\"type\":\"content_block_stop\"}",
                 "id": null,
                 "retry": null
               },
