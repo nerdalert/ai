@@ -85,6 +85,29 @@ async fn maps_refusal_stop_reason_to_content_filter_finish_reason() {
 }
 
 #[tokio::test]
+async fn maps_context_window_exhaustion_to_length_finish_reason() {
+    let filter = filter("{}");
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+    let mut response = sse_response();
+    let mut ctx = crate::test_utils::make_filter_context(&request);
+    arm(&mut ctx, true);
+    ctx.response_header = Some(&mut response);
+    assert!(matches!(
+        filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let events = EVENTS.replace("end_turn", "model_context_window_exceeded");
+    let mut body = Some(Bytes::from(events));
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, true).unwrap(),
+        FilterAction::Continue
+    ));
+    let output = std::str::from_utf8(body.as_ref().unwrap()).unwrap();
+    assert!(output.contains("\"finish_reason\":\"length\""));
+    assert!(output.contains("data: [DONE]"));
+}
+
+#[tokio::test]
 async fn converts_tool_deltas_and_stops_after_message_stop() {
     let filter = filter("{}");
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");

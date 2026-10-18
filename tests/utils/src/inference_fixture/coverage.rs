@@ -1311,6 +1311,7 @@ mod tests {
                 vec!["openai_chat_completions_to_anthropic_messages"],
                 vec!["openai_chat_completions_to_anthropic_messages"],
                 vec!["openai_chat_completions_to_anthropic_messages"],
+                vec!["openai_chat_completions_to_anthropic_messages"],
                 vec!["responses_native_passthrough"],
             ]
         );
@@ -1405,7 +1406,7 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 82, "manifest feature inventory count");
+        assert_eq!(report.features_total, 83, "manifest feature inventory count");
         assert_eq!(report.scenarios_total, 64, "manifest scenario inventory count");
         assert_eq!(report.recordings_total, 69, "manifest recording inventory count");
         assert_eq!(
@@ -1478,7 +1479,7 @@ mod tests {
                 "vertex/invalid-content",
             ]
         );
-        assert_eq!(manifest.features.len(), 82, "manifest must declare every feature");
+        assert_eq!(manifest.features.len(), 83, "manifest must declare every feature");
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1853,6 +1854,10 @@ mod tests {
                     &vec!["openai_legacy/anthropic-json-sse-error".to_owned()]
                 ),
                 (
+                    &"external_model.anthropic.response.context_window".to_owned(),
+                    &vec!["openai_legacy/anthropic-json-sse-error".to_owned()]
+                ),
+                (
                     &"external_model.anthropic.error".to_owned(),
                     &vec!["openai_legacy/anthropic-json-sse-error".to_owned()]
                 ),
@@ -2032,7 +2037,7 @@ mod tests {
                 vec![("synthetic", CoverageStatus::SyntheticOnly)],
             );
         }
-        for feature in &manifest.features[77..81] {
+        for feature in &manifest.features[77..82] {
             assert_eq!(
                 feature
                     .providers

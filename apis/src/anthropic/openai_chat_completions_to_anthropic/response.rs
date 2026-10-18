@@ -10,7 +10,7 @@ pub(crate) fn map_stop_reason(stop_reason: &str) -> Result<&'static str, String>
     match stop_reason {
         "end_turn" | "stop_sequence" => Ok("stop"),
         "tool_use" => Ok("tool_calls"),
-        "max_tokens" => Ok("length"),
+        "max_tokens" | "model_context_window_exceeded" => Ok("length"),
         "refusal" => Ok("content_filter"),
         other => Err(format!("unsupported Anthropic stop_reason {other:?}")),
     }

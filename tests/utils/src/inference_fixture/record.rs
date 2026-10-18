@@ -3342,13 +3342,16 @@ mod tests {
             .await
             .expect_err("recording must report the declared/observed client-status mismatch");
 
-        assert!(matches!(
-            error,
-            FixtureError::UnexpectedRecordedClientStatus {
-                actual: 200,
-                expected: 201
-            }
-        ));
+        assert!(
+            matches!(
+                error,
+                FixtureError::UnexpectedRecordedClientStatus {
+                    actual: 200,
+                    expected: 201
+                }
+            ),
+            "recording should report actual status 200 against declared status 201"
+        );
         provider.finish().await;
     }
 

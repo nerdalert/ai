@@ -130,6 +130,15 @@ fn maps_refusal_stop_reason_to_content_filter() {
 }
 
 #[test]
+fn maps_context_window_exhaustion_to_length() {
+    let body = br#"{"type":"message","id":"msg_context_limit","role":"assistant","model":"claude","content":[{"type":"text","text":"partial answer"}],"stop_reason":"model_context_window_exceeded","usage":{"input_tokens":4,"output_tokens":6}}"#;
+    let translated: Value =
+        serde_json::from_slice(&response::translate_response(body, "client-model").unwrap()).unwrap();
+    assert_eq!(translated["choices"][0]["message"]["content"], "partial answer");
+    assert_eq!(translated["choices"][0]["finish_reason"], "length");
+}
+
+#[test]
 fn maps_anthropic_errors_to_openai_error_envelope() {
     let error = response::translate_error(
         br#"{"type":"error","error":{"type":"overloaded_error","message":"busy"}}"#,

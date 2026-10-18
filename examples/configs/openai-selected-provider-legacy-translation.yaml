@@ -1,6 +1,6 @@
 # OpenAI Chat Completions clients reach the overlay-selected Anthropic Messages
-# or OpenAI-compatible provider. Anthropic JSON and SSE responses are translated
-# to OpenAI format; OpenAI-compatible responses pass through unchanged.
+# or OpenAI-compatible provider and receive translated Anthropic JSON/SSE or
+# unchanged OpenAI-compatible responses.
 # `intelligent_route` binds the trusted provider profile to each request before
 # response and SSE processing.
 

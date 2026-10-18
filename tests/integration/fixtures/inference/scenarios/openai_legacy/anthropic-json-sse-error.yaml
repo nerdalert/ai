@@ -8,6 +8,7 @@ features:
   - external_model.anthropic.request.text
   - external_model.anthropic.response.json
   - external_model.anthropic.response.sse
+  - external_model.anthropic.response.context_window
   - external_model.anthropic.error
 turns:
   - name: json
@@ -89,3 +90,59 @@ turns:
       upstream_body_kind: json
       client_sse_events: []
       upstream_sse_events: []
+  - name: context-window-json
+    request:
+      method: POST
+      path: /v1/chat/completions
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          max_tokens: 16
+          messages:
+            - role: user
+              content: Keep answering until the context window is exhausted.
+          stream: false
+    expect:
+      client_status: 200
+      client_body_kind: json
+      upstream_path: /v1/messages
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []
+  - name: context-window-stream
+    request:
+      method: POST
+      path: /v1/chat/completions
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          max_tokens: 16
+          messages:
+            - role: user
+              content: Stream until the context window is exhausted.
+          stream: true
+          stream_options:
+            include_usage: true
+    expect:
+      client_status: 200
+      client_body_kind: sse
+      upstream_path: /v1/messages
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events:
+        - message_start
+        - content_block_start
+        - content_block_delta
+        - content_block_stop
+        - message_delta
+        - message_stop
+      upstream_sse_repeatable_events:
+        - content_block_delta
