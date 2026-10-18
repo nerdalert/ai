@@ -161,6 +161,9 @@ mod tests {
             selection_tier: None,
             site: Arc::from("site"),
             stable_id: Arc::from("stable"),
+            api_format: None,
+            path: None,
+            target_model: None,
         }
     }
 

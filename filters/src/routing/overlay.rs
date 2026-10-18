@@ -314,6 +314,18 @@ pub(crate) struct OverlayCandidate {
     /// Deterministic identifier assigned by the configuration producer.
     #[serde(default)]
     pub(crate) stable_id: Option<String>,
+
+    /// Trusted provider API format, present only on provider-aware candidates.
+    #[serde(default)]
+    pub(crate) api_format: Option<String>,
+
+    /// Trusted provider request path, present only on provider-aware candidates.
+    #[serde(default)]
+    pub(crate) path: Option<String>,
+
+    /// Trusted provider target model, present only on provider-aware candidates.
+    #[serde(default)]
+    pub(crate) target_model: Option<String>,
 }
 
 /// Default freshness for overlay candidates.
@@ -552,6 +564,11 @@ impl RouteSnapshot {
             .map_err(|e| FilterError::from(format!("routing: overlay parse error: {e}")))?;
 
         descriptor::validate_local_site(&doc.local_site)?;
+        if doc.candidates.iter().any(|candidate| {
+            candidate.api_format.is_some() || candidate.path.is_some() || candidate.target_model.is_some()
+        }) {
+            return Err("routing: provider profiles require a versioned content-addressed overlay".into());
+        }
         let selection_mode = doc
             .selection_policy
             .map_or(PickerPolicy::Deterministic, |policy| policy.mode);
@@ -855,6 +872,124 @@ pub(super) fn enrich_from_overlay(
             }
             c.stable_id = Arc::from(id.as_str());
         }
+        enrich_provider_profile(i, c, oc)?;
+    }
+    Ok(())
+}
+
+/// Validate and copy an optional trusted provider profile from one overlay entry.
+fn enrich_provider_profile(
+    index: usize,
+    candidate: &mut RouteCandidate,
+    overlay: &OverlayCandidate,
+) -> Result<(), FilterError> {
+    let (api_format, path, target_model) = match (
+        overlay.api_format.as_deref(),
+        overlay.path.as_deref(),
+        overlay.target_model.as_deref(),
+    ) {
+        (None, None, None) => return Ok(()),
+        (Some(api_format), Some(path), Some(target_model)) => (api_format, path, target_model),
+        _ => {
+            return Err(format!(
+                "routing: candidate {index}: api_format, path, and target_model must be supplied together"
+            )
+            .into());
+        },
+    };
+    if overlay.stable_id.is_none() {
+        return Err(format!("routing: candidate {index}: provider profile requires stable_id").into());
+    }
+    let profile = ProviderProfile {
+        api_format,
+        path,
+        target_model,
+    };
+    validate_provider_profile(index, candidate.kind, candidate.credential.as_ref(), &profile)?;
+    candidate.api_format = Some(Arc::from(api_format));
+    candidate.path = Some(Arc::from(path));
+    candidate.target_model = Some(Arc::from(target_model));
+    Ok(())
+}
+
+/// Borrowed fields that must be validated as one provider profile.
+struct ProviderProfile<'a> {
+    /// Request API dialect selected by the provider binding.
+    api_format: &'a str,
+    /// Upstream request path selected by the provider binding.
+    path: &'a str,
+    /// Upstream model name selected by the provider binding.
+    target_model: &'a str,
+}
+
+/// Reject incomplete, unsupported, or unsafe provider profiles before a new
+/// overlay snapshot can replace the last-known-good serving snapshot.
+fn validate_provider_profile(
+    index: usize,
+    kind: CapabilityKind,
+    credential: Option<&CandidateCredential>,
+    profile: &ProviderProfile<'_>,
+) -> Result<(), FilterError> {
+    validate_provider_kind(index, kind)?;
+    validate_provider_api_format(index, profile.api_format)?;
+    validate_provider_path(index, profile.path)?;
+    validate_provider_target_model(index, profile.target_model)?;
+    validate_provider_credential(index, profile.api_format, credential)
+}
+
+/// Ensure selected provider profiles are attached only to inference routes.
+fn validate_provider_kind(index: usize, kind: CapabilityKind) -> Result<(), FilterError> {
+    if kind != CapabilityKind::InferenceModel {
+        return Err(format!("routing: candidate {index}: provider profiles require inference_model kind").into());
+    }
+    Ok(())
+}
+
+/// Ensure the provider dialect is one the translation dispatcher understands.
+fn validate_provider_api_format(index: usize, api_format: &str) -> Result<(), FilterError> {
+    if !matches!(api_format, "openai-chat" | "messages") {
+        return Err(format!("routing: candidate {index}: unsupported api_format {api_format:?}").into());
+    }
+    Ok(())
+}
+
+/// Ensure the provider request target is a safe absolute path without a query.
+fn validate_provider_path(index: usize, path: &str) -> Result<(), FilterError> {
+    if path.is_empty()
+        || path.len() > 2048
+        || !path.starts_with('/')
+        || path
+            .chars()
+            .any(|character| matches!(character, '?' | '#' | '\r' | '\n'))
+        || path.parse::<http::uri::PathAndQuery>().is_err()
+    {
+        return Err(format!("routing: candidate {index}: path must be a valid absolute-path request target").into());
+    }
+    Ok(())
+}
+
+/// Ensure the provider model name is bounded and contains no control bytes.
+fn validate_provider_target_model(index: usize, target_model: &str) -> Result<(), FilterError> {
+    if target_model.trim().is_empty()
+        || target_model.len() > 256
+        || target_model.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err(format!("routing: candidate {index}: target_model must be 1-256 printable bytes").into());
+    }
+    Ok(())
+}
+
+/// Require an API-key Secret reference for Anthropic Messages providers.
+fn validate_provider_credential(
+    index: usize,
+    api_format: &str,
+    credential: Option<&CandidateCredential>,
+) -> Result<(), FilterError> {
+    if api_format == "messages" && credential.is_none_or(|value| value.strategy != "apikey") {
+        return Err(format!(
+            "routing: candidate {index}: messages provider profile requires an apikey credential reference"
+        )
+        .into());
     }
     Ok(())
 }

@@ -316,6 +316,7 @@ pub(super) fn load_and_validate_config_source(scenario: &InferenceScenario) -> R
     let path = resolve_example_config_path(Path::new(&config_root), Path::new(&scenario.example_config))?;
     let source =
         std::fs::read_to_string(path).map_err(|_source| runtime_error("scenario example config could not be read"))?;
+    let source = patch_fixture_overlay_path(&source)?;
     let contained = contain_replay_external_resources(&source)?;
     let config =
         Config::from_yaml(&contained).map_err(|_source| runtime_error("scenario example config is invalid"))?;
@@ -399,7 +400,7 @@ pub(super) fn build_replay_config_with_aliases(
     let port_map: HashMap<_, _> = std::iter::once((upstream_authority, backend_port))
         .chain(aliases.iter().map(|alias| (alias.as_str(), backend_port)))
         .collect();
-    let patched = patch_yaml(source, listener_port, &port_map);
+    let patched = patch_fixture_overlay_path(&patch_yaml(source, listener_port, &port_map))?;
     let contained = contain_replay_external_resources(&patched)?;
     let config =
         Config::from_yaml(&contained).map_err(|_source| runtime_error("patched scenario config is invalid"))?;
@@ -427,35 +428,41 @@ fn validate_replay_filters(config: &Config) -> Result<(), FixtureError> {
 /// `tools/list` callout. Replay admits it only as deferred-connector
 /// sanitization, gated by `filter_is_replay_contained` plus scenario
 /// request inspection in `validate_mcp_resolve_replay_requests`.
+const REPLAY_CONTAINED_FILTERS: &[&str] = &[
+    "ai_operation",
+    "openai_agentic_loop",
+    "anthropic_messages_request",
+    "anthropic_messages_protocol",
+    "anthropic_messages_to_vertexai_anthropic",
+    "anthropic_messages_to_chat_completions",
+    "anthropic_messages_to_chat_completions_stream",
+    "openai_chat_completions_to_anthropic",
+    "openai_chat_completions_to_anthropic_stream",
+    "iterative_request_router",
+    "intelligent_route",
+    "model_to_header",
+    "openai_responses_proxy",
+    "path_rewrite",
+    "openai_responses_request",
+    "openai_client_tool_compat",
+    "state_owner",
+    "openai_responses_store",
+    "openai_responses_rehydrate",
+    "openai_stream_events",
+    "openai_tool_parse",
+    "openai_chat_completions_to_bedrock_converse",
+    "openai_chat_completions_to_azureai_chat_completions",
+    "openai_chat_completions_to_vertexai_gemini",
+    "openai_responses_to_chat_completions",
+    "aws_sigv4_sign",
+    "model_to_provider",
+    "router",
+    "load_balancer",
+];
+
+/// Check whether a filter is known to have no external side effects during replay.
 fn is_replay_contained_filter(filter_type: &str) -> bool {
-    matches!(
-        filter_type,
-        "ai_operation"
-            | "openai_agentic_loop"
-            | "anthropic_messages_request"
-            | "anthropic_messages_protocol"
-            | "anthropic_messages_to_vertexai_anthropic"
-            | "anthropic_messages_to_chat_completions"
-            | "anthropic_messages_to_chat_completions_stream"
-            | "iterative_request_router"
-            | "openai_responses_proxy"
-            | "path_rewrite"
-            | "openai_responses_request"
-            | "openai_client_tool_compat"
-            | "state_owner"
-            | "openai_responses_store"
-            | "openai_responses_rehydrate"
-            | "openai_stream_events"
-            | "openai_tool_parse"
-            | "openai_chat_completions_to_bedrock_converse"
-            | "openai_chat_completions_to_azureai_chat_completions"
-            | "openai_chat_completions_to_vertexai_gemini"
-            | "openai_responses_to_chat_completions"
-            | "aws_sigv4_sign"
-            | "model_to_provider"
-            | "router"
-            | "load_balancer"
-    )
+    REPLAY_CONTAINED_FILTERS.contains(&filter_type)
 }
 
 /// Whether one filter entry is replay-contained, including literal credentials
@@ -463,6 +470,9 @@ fn is_replay_contained_filter(filter_type: &str) -> bool {
 fn filter_is_replay_contained(filter: &FilterEntry) -> bool {
     if filter.filter_type == "credential_injection" {
         return filter.config.as_mapping().is_some_and(has_literal_replay_credentials);
+    }
+    if filter.filter_type == "credential_inject" {
+        return filter.config.as_mapping().is_some_and(has_literal_provider_credentials);
     }
     filter.filter_type == "openai_mcp_tool_resolve" || is_replay_contained_filter(filter.filter_type.as_str())
 }
@@ -483,12 +493,31 @@ fn has_literal_replay_credentials(config: &serde_yaml::Mapping) -> bool {
 
 /// Rejects credential mappings without explicit literal replay values.
 fn validate_replay_literal_credentials(mapping: &serde_yaml::Mapping) -> Result<(), FixtureError> {
-    if mapping.get("filter").and_then(serde_yaml::Value::as_str) == Some("credential_injection")
-        && !has_literal_replay_credentials(mapping)
-    {
-        return Err(runtime_error("scenario credentials are not replay-contained"));
+    match mapping.get("filter").and_then(serde_yaml::Value::as_str) {
+        Some("credential_injection") if !has_literal_replay_credentials(mapping) => {
+            return Err(runtime_error("scenario credentials are not replay-contained"));
+        },
+        Some("credential_inject") if !has_literal_provider_credentials(mapping) => {
+            return Err(runtime_error("scenario provider credentials are not replay-contained"));
+        },
+        _ => {},
     }
     Ok(())
+}
+
+/// Allows only inline dummy credentials in the replay-owned provider filter.
+fn has_literal_provider_credentials(config: &serde_yaml::Mapping) -> bool {
+    config
+        .get("credentials")
+        .and_then(serde_yaml::Value::as_sequence)
+        .filter(|credentials| !credentials.is_empty())
+        .is_some_and(|credentials| {
+            credentials.iter().all(|credential| {
+                credential.get("value").and_then(serde_yaml::Value::as_str).is_some()
+                    && credential.get("env_var").is_none_or(serde_yaml::Value::is_null)
+                    && credential.get("file").is_none_or(serde_yaml::Value::is_null)
+            })
+        })
 }
 
 /// Rejects `openai_mcp_tool_resolve` fixtures whose requests would eager-list.
@@ -657,10 +686,12 @@ fn contain_replay_external_value(value: &mut serde_yaml::Value) -> Result<(), Fi
 fn contain_replay_external_mapping(mapping: &mut serde_yaml::Mapping) -> Result<(), FixtureError> {
     validate_replay_literal_credentials(mapping)?;
     contain_sigv4_credentials(mapping);
-    if mapping
-        .iter()
-        .any(|(key, value)| key.as_str().is_some_and(is_file_resource_key) && !matches!(value, serde_yaml::Value::Null))
-    {
+    let unsafe_file = mapping.iter().any(|(key, value)| {
+        key.as_str().is_some_and(is_file_resource_key)
+            && !matches!(value, serde_yaml::Value::Null)
+            && !(key.as_str() == Some("overlay_file") && is_fixture_overlay_path(value))
+    });
+    if unsafe_file {
         return Err(runtime_error("scenario local resource is not replay-contained"));
     }
     let backend = mapping.iter().find_map(|(key, value)| {
@@ -722,6 +753,49 @@ fn is_file_resource_key(key: &str) -> bool {
             key.as_str(),
             "ssl_root_cert" | "ssl_cert" | "ssl_key" | "certificate_file" | "private_key_file" | "ca_file"
         )
+}
+
+/// One checked-in, non-secret routing profile used by the provider-aware
+/// translation replay fixture. No scenario may choose an arbitrary local file.
+const FIXTURE_OVERLAY_RELATIVE_PATH: &str = "tests/integration/fixtures/inference/routing/openai-to-anthropic.json";
+
+/// Resolve the fixture overlay from the package root without trusting the
+/// process working directory.
+fn fixture_overlay_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(FIXTURE_OVERLAY_RELATIVE_PATH)
+}
+
+/// Replace the fixture-only relative path with its canonical repository path.
+fn patch_fixture_overlay_path(source: &str) -> Result<String, FixtureError> {
+    let path = fixture_overlay_path()
+        .canonicalize()
+        .map_err(|_source| runtime_error("provider-aware fixture overlay could not be resolved"))?;
+    let path = path
+        .to_str()
+        .ok_or_else(|| runtime_error("provider-aware fixture overlay path is not valid UTF-8"))?;
+    // The recorder preflight returns a config with the relative fixture path
+    // already expanded. Avoid expanding the suffix inside that absolute path
+    // a second time when the config is patched for replay.
+    if source.contains(path) || !source.contains(FIXTURE_OVERLAY_RELATIVE_PATH) {
+        return Ok(source.to_owned());
+    }
+    Ok(source.replace(FIXTURE_OVERLAY_RELATIVE_PATH, path))
+}
+
+/// Accept only the canonical checked-in overlay used by this replay fixture.
+fn is_fixture_overlay_path(value: &serde_yaml::Value) -> bool {
+    let Some(path) = value.as_str() else {
+        return false;
+    };
+    let Ok(actual) = Path::new(path).canonicalize() else {
+        return false;
+    };
+    let Ok(expected) = fixture_overlay_path().canonicalize() else {
+        return false;
+    };
+    actual == expected
 }
 
 /// Accepts SQLite URLs and scheme-less paths that replay replaces in memory.
@@ -1872,6 +1946,40 @@ mod tests {
         validate_scenario_requests, validate_singular_endpoint, validate_sse_events, validate_upstream_inputs,
     };
     use crate::{example_config_path, free_port_guard, proxy::blocked_proxy_guard_for_test};
+
+    #[test]
+    fn selected_provider_legacy_fixture_config_is_replay_contained() {
+        let source = std::fs::read_to_string(example_config_path("openai-selected-provider-legacy-fixture.yaml"))
+            .expect("selected-provider fixture example should exist");
+        let patched = super::patch_fixture_overlay_path(&source).expect("checked-in fixture overlay should resolve");
+        let contained = super::contain_replay_external_resources(&patched)
+            .expect("fixture replay should admit only its canonical routing profile");
+        let config = Config::from_yaml(&contained).expect("fixture example should parse");
+        validate_replay_filters(&config).expect("fixture filters should be replay-contained");
+    }
+
+    #[test]
+    fn selected_provider_legacy_scenario_passes_complete_recording_preflight() {
+        let scenario_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../integration/fixtures/inference/scenarios/openai_legacy/anthropic-json-sse-error.yaml");
+        let scenario_source = std::fs::read_to_string(scenario_path).expect("selected-provider scenario should exist");
+        let scenario: InferenceScenario =
+            serde_yaml::from_str(&scenario_source).expect("selected-provider scenario should parse");
+
+        load_and_validate_config_source(&scenario).expect("complete recording preflight should pass");
+    }
+
+    #[test]
+    fn selected_provider_legacy_replay_config_keeps_the_fixture_overlay_contained() {
+        let scenario_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../integration/fixtures/inference/scenarios/openai_legacy/anthropic-json-sse-error.yaml");
+        let scenario_source = std::fs::read_to_string(scenario_path).expect("selected-provider scenario should exist");
+        let scenario: InferenceScenario =
+            serde_yaml::from_str(&scenario_source).expect("selected-provider scenario should parse");
+        let source = load_and_validate_config_source(&scenario).expect("recording preflight should pass");
+        build_replay_config_with_aliases(&source, 19_001, &scenario.upstream_authority, &[], 19_002)
+            .expect("replay-owned config should pass all network checks");
+    }
 
     #[tokio::test]
     async fn runner_rejects_vacuous_turns_before_starting_a_backend() {

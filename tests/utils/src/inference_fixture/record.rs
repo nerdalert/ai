@@ -397,6 +397,12 @@ pub(super) async fn record_live(
         .await
         {
             Ok(client_response) => {
+                if client_response.status != turn.expect.client_status {
+                    operation_error = Some(FixtureError::UnexpectedRecordedClientStatus {
+                        actual: client_response.status,
+                        expected: turn.expect.client_status,
+                    });
+                }
                 previous_response_id = client_response.response_id().map(str::to_owned);
                 let exchange = BorrowedRecordedExchange {
                     request: &turn.request,
@@ -414,7 +420,9 @@ pub(super) async fn record_live(
             },
             Err(error) => operation_error = Some(error),
         }
-        if let Err(error) = recorder.wait_for_attempts(attempts, RECORDING_WAIT_TIMEOUT).await {
+        if let Err(error) = recorder.wait_for_attempts(attempts, RECORDING_WAIT_TIMEOUT).await
+            && operation_error.is_none()
+        {
             operation_error = Some(error);
         }
         if operation_error.is_some() {
@@ -426,11 +434,24 @@ pub(super) async fn record_live(
         .shutdown()
         .map_err(|_error| runtime_error("scenario proxy shutdown did not complete"));
     let captured = recorder.finish_captures(attempts);
-    let captured = captured?;
     proxy_result?;
-    if let Some(error) = operation_error {
-        return Err(error);
-    }
+    let captured = match captured {
+        Err(FixtureError::ReplayRuntime {
+            message: "recording proxy captured an unexpected request count",
+        }) => {
+            if let Some(error) = operation_error {
+                return Err(error);
+            }
+            return Err(runtime_error("recording proxy captured an unexpected request count"));
+        },
+        Err(error) => return Err(error),
+        Ok(captured) => {
+            if let Some(error) = operation_error {
+                return Err(error);
+            }
+            captured
+        },
+    };
     if pending.len() != expected_turns || captured.len() != expected_turns {
         return Err(runtime_error("recording scenario did not complete every turn"));
     }

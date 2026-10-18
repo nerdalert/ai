@@ -10,6 +10,7 @@ scope:
   - openai_chat_completions_to_azureai_chat_completions
   - openai_chat_completions_to_vertexai_gemini
   - anthropic_messages_to_vertexai_anthropic
+  - openai_chat_completions_to_anthropic_messages
 features:
   - id: bedrock.converse.request.text
     scopes:
@@ -733,6 +734,42 @@ features:
     status: synthetic_only
     scenarios:
       - vertex/anthropic-wire-translation
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: external_model.anthropic.request.text
+    scopes:
+      - openai_chat_completions_to_anthropic_messages
+    status: synthetic_only
+    scenarios:
+      - openai_legacy/anthropic-json-sse-error
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: external_model.anthropic.response.json
+    scopes:
+      - openai_chat_completions_to_anthropic_messages
+    status: synthetic_only
+    scenarios:
+      - openai_legacy/anthropic-json-sse-error
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: external_model.anthropic.response.sse
+    scopes:
+      - openai_chat_completions_to_anthropic_messages
+    status: synthetic_only
+    scenarios:
+      - openai_legacy/anthropic-json-sse-error
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: external_model.anthropic.error
+    scopes:
+      - openai_chat_completions_to_anthropic_messages
+    status: synthetic_only
+    scenarios:
+      - openai_legacy/anthropic-json-sse-error
     providers:
       synthetic:
         status: synthetic_only
