@@ -230,6 +230,15 @@ pub(crate) struct RouteCandidate {
 
     /// Deterministic identifier for session affinity binding.
     pub stable_id: Arc<str>,
+
+    /// Provider API format from a trusted, versioned overlay.
+    pub api_format: Option<Arc<str>>,
+
+    /// Provider request path from the same selected overlay candidate.
+    pub path: Option<Arc<str>>,
+
+    /// Provider target model from the same selected overlay candidate.
+    pub target_model: Option<Arc<str>>,
 }
 
 // -----------------------------------------------------------------------------
@@ -319,6 +328,9 @@ fn validate_candidates_with_empty(
             selection_tier: None,
             site: Arc::from(c.site.as_str()),
             stable_id,
+            api_format: None,
+            path: None,
+            target_model: None,
         });
     }
 

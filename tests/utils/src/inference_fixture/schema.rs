@@ -691,6 +691,14 @@ pub enum FixtureError {
         /// A non-secret description of the failed replay operation.
         message: &'static str,
     },
+    /// The recording client received a response with an unexpected HTTP status.
+    #[error("recorded client returned HTTP {actual} (expected {expected})")]
+    UnexpectedRecordedClientStatus {
+        /// Status observed by the recording client.
+        actual: u16,
+        /// Status declared by the scenario.
+        expected: u16,
+    },
     /// Replay client I/O failed without retaining transport details.
     #[error("scenario HTTP operation failed")]
     ReplayHttp,
