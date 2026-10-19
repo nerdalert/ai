@@ -62,6 +62,33 @@ async fn converts_anthropic_sse_incrementally_and_emits_openai_termination_and_u
 }
 
 #[tokio::test]
+async fn terminal_sse_usage_includes_cached_input() {
+    let filter = filter("{}");
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+    let mut response = sse_response();
+    let mut ctx = crate::test_utils::make_filter_context(&request);
+    arm(&mut ctx, true);
+    ctx.response_header = Some(&mut response);
+    assert!(matches!(
+        filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let events = EVENTS.replace(
+        "\"input_tokens\":3",
+        "\"input_tokens\":10,\"cache_read_input_tokens\":1000,\"cache_creation_input_tokens\":50",
+    );
+    let mut body = Some(Bytes::from(events));
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, true).unwrap(),
+        FilterAction::Continue
+    ));
+    let output = std::str::from_utf8(body.as_ref().unwrap()).unwrap();
+    assert!(output.contains("\"prompt_tokens\":1060"));
+    assert!(output.contains("\"total_tokens\":1062"));
+    assert!(output.contains("data: [DONE]"));
+}
+
+#[tokio::test]
 async fn maps_refusal_stop_reason_to_content_filter_finish_reason() {
     let filter = filter("{}");
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");

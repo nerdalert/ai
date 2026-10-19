@@ -20,7 +20,7 @@ use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
     SelectedUpstreamBodyOutcome, parse_filter_config,
 };
-pub(crate) use response::map_stop_reason;
+pub(crate) use response::{map_stop_reason, total_input_tokens};
 
 use self::config::OpenaiChatCompletionsToAnthropicConfig;
 
@@ -60,6 +60,8 @@ pub(super) const INCLUDE_USAGE: &str = "openai_chat_completions_to_anthropic_str
 const RESPONSE_ARMED: &str = "openai_chat_completions_to_anthropic.response_armed";
 /// Marker indicating that the selected upstream returned an error response.
 const RESPONSE_ERROR: &str = "openai_chat_completions_to_anthropic.response_error";
+/// Upstream status saved before the body phase loses response-header access.
+const RESPONSE_STATUS: &str = "openai_chat_completions_to_anthropic.response_status";
 
 /// Immutable selected provider profile carried from the request to its response.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -346,6 +348,7 @@ impl HttpFilter for OpenaiChatCompletionsToAnthropicFilter {
         let Some(response) = ctx.response_header.as_ref() else {
             return Err("openai_chat_completions_to_anthropic: response headers are missing".into());
         };
+        let status = response.status.as_u16();
         let success = response.status.is_success();
         let is_event_stream = response
             .headers
@@ -386,6 +389,7 @@ impl HttpFilter for OpenaiChatCompletionsToAnthropicFilter {
         }
         ctx.set_metadata(RESPONSE_ARMED, "true");
         ctx.set_metadata(RESPONSE_ERROR, (!success).to_string());
+        ctx.set_metadata(RESPONSE_STATUS, status.to_string());
         Ok(FilterAction::Continue)
     }
 
@@ -434,9 +438,9 @@ impl HttpFilter for OpenaiChatCompletionsToAnthropicFilter {
         let raw = buffered.bytes.as_slice();
         let translated = if ctx.get_metadata(RESPONSE_ERROR) == Some("true") {
             let status = ctx
-                .response_header
-                .as_ref()
-                .map_or(502, |response| response.status.as_u16());
+                .get_metadata(RESPONSE_STATUS)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(502);
             response::translate_error(raw, status)
         } else {
             let client_model = ctx.get_metadata(CLIENT_MODEL).unwrap_or("unknown");

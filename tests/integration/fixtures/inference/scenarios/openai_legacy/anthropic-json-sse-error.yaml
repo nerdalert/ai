@@ -8,6 +8,7 @@ features:
   - external_model.anthropic.request.text
   - external_model.anthropic.response.json
   - external_model.anthropic.response.sse
+  - external_model.anthropic.response.cached_usage
   - external_model.anthropic.response.context_window
   - external_model.anthropic.error
 turns:

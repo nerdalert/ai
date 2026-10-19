@@ -18,7 +18,7 @@ use tracing::warn;
 
 use self::config::OpenaiChatCompletionsToAnthropicStreamConfig;
 use super::openai_chat_completions_to_anthropic::{
-    BOUND_PREFIX, CLIENT_MODEL, INCLUDE_USAGE, REQUEST_STREAM, map_stop_reason,
+    BOUND_PREFIX, CLIENT_MODEL, INCLUDE_USAGE, REQUEST_STREAM, map_stop_reason, total_input_tokens,
 };
 
 /// Registered filter identifier.
@@ -193,11 +193,11 @@ impl OpenaiChatCompletionsToAnthropicStreamFilter {
             .filter(|value| !value.is_empty())
             .ok_or("Anthropic message_start requires message.id")?;
         state.message_id = Some(format!("chatcmpl-{id}"));
-        state.input_tokens = message
+        let usage = message
             .get("usage")
-            .and_then(|usage| usage.get("input_tokens"))
-            .and_then(Value::as_u64)
-            .ok_or("Anthropic message_start requires non-negative usage.input_tokens")?;
+            .and_then(Value::as_object)
+            .ok_or("Anthropic message_start requires usage")?;
+        state.input_tokens = total_input_tokens(usage)?;
         append_chunk(output, state, &json!({"role":"assistant"}), &Value::Null).map_err(|error| error.to_string())?;
         state.started = true;
         Ok(())

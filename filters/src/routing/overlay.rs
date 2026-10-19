@@ -67,6 +67,9 @@ const WATCHER_START_TIMEOUT: Duration = Duration::from_secs(5);
 /// Maximum length of envelope scope and provenance string fields.
 const MAX_ENVELOPE_FIELD_LEN: usize = 256;
 
+/// Request metadata carries the selected provider path with this value limit.
+const MAX_PROVIDER_PATH_LEN: usize = 256;
+
 // -----------------------------------------------------------------------------
 // Contract format
 // -----------------------------------------------------------------------------
@@ -946,14 +949,17 @@ fn validate_provider_api_format(index: usize, api_format: &str) -> Result<Provid
 /// Ensure the provider request target is a safe absolute path without a query.
 fn validate_provider_path(index: usize, path: &str) -> Result<(), FilterError> {
     if path.is_empty()
-        || path.len() > 2048
+        || path.len() > MAX_PROVIDER_PATH_LEN
         || !path.starts_with('/')
         || path
             .chars()
             .any(|character| matches!(character, '?' | '#' | '\r' | '\n'))
         || path.parse::<http::uri::PathAndQuery>().is_err()
     {
-        return Err(format!("routing: candidate {index}: path must be a valid absolute-path request target").into());
+        return Err(format!(
+            "routing: candidate {index}: path must be a valid absolute-path request target of at most {MAX_PROVIDER_PATH_LEN} bytes"
+        )
+        .into());
     }
     Ok(())
 }
@@ -2424,6 +2430,23 @@ mod tests {
                 "unexpected validation error: {error}"
             );
         }
+    }
+
+    #[test]
+    fn provider_path_must_fit_request_metadata() {
+        let accepted = format!("/{}", "x".repeat(255));
+        let overlay = make_provider_profile_overlay(Some("messages"), Some(&accepted), Some("claude-test"));
+        assert!(
+            RouteSnapshot::from_overlay(overlay.as_bytes()).is_ok(),
+            "256-byte path should be accepted"
+        );
+
+        let rejected = format!("/{}", "x".repeat(256));
+        let overlay = make_provider_profile_overlay(Some("messages"), Some(&rejected), Some("claude-test"));
+        assert!(
+            RouteSnapshot::from_overlay(overlay.as_bytes()).is_err(),
+            "257-byte path should be rejected"
+        );
     }
 
     fn make_empty_envelope_json(local_site: &str, network: &str) -> String {

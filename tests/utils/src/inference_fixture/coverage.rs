@@ -1312,6 +1312,7 @@ mod tests {
                 vec!["openai_chat_completions_to_anthropic_messages"],
                 vec!["openai_chat_completions_to_anthropic_messages"],
                 vec!["openai_chat_completions_to_anthropic_messages"],
+                vec!["openai_chat_completions_to_anthropic_messages"],
                 vec!["responses_native_passthrough"],
             ]
         );
@@ -1404,11 +1405,13 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 83, "manifest feature inventory count");
-        assert_eq!(report.scenarios_total, 64, "manifest scenario inventory count");
-        assert_eq!(report.recordings_total, 69, "manifest recording inventory count");
+        assert_eq!(report.features_total, 84, "manifest feature inventory count");
+        assert_eq!(report.scenarios_total, 65, "manifest scenario inventory count");
+        assert_eq!(report.recordings_total, 70, "manifest recording inventory count");
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1479,7 +1482,7 @@ mod tests {
                 "vertex/invalid-content",
             ]
         );
-        assert_eq!(manifest.features.len(), 83, "manifest must declare every feature");
+        assert_eq!(manifest.features.len(), 84, "manifest must declare every feature");
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1851,6 +1854,10 @@ mod tests {
                 ),
                 (
                     &"external_model.anthropic.response.sse".to_owned(),
+                    &vec!["openai_legacy/anthropic-json-sse-error".to_owned()]
+                ),
+                (
+                    &"external_model.anthropic.response.cached_usage".to_owned(),
                     &vec!["openai_legacy/anthropic-json-sse-error".to_owned()]
                 ),
                 (

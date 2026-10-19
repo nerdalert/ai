@@ -74,8 +74,11 @@
               "object": "chat.completion",
               "usage": {
                 "completion_tokens": 2,
-                "prompt_tokens": 4,
-                "total_tokens": 6
+                "prompt_tokens": 1060,
+                "prompt_tokens_details": {
+                  "cached_tokens": 1000
+                },
+                "total_tokens": 1062
               }
             }
           }
@@ -135,7 +138,9 @@
               "stop_reason": "end_turn",
               "type": "message",
               "usage": {
-                "input_tokens": 4,
+                "cache_creation_input_tokens": 50,
+                "cache_read_input_tokens": 1000,
+                "input_tokens": 10,
                 "output_tokens": 2
               }
             }
@@ -208,7 +213,7 @@
               },
               {
                 "event": null,
-                "data": "{\"choices\":[],\"created\":0,\"id\":\"chatcmpl-recorded-0003\",\"model\":\"fixture-openai-model\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":4,\"prompt_tokens\":3,\"total_tokens\":7}}",
+                "data": "{\"choices\":[],\"created\":0,\"id\":\"chatcmpl-recorded-0003\",\"model\":\"fixture-openai-model\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":4,\"prompt_tokens\":1060,\"total_tokens\":1064}}",
                 "id": null,
                 "retry": null
               }
@@ -261,7 +266,7 @@
             "frames": [
               {
                 "event": "message_start",
-                "data": "{\"message\":{\"content\":[],\"id\":\"msg_recorded_0004\",\"model\":\"claude-fixture-model\",\"role\":\"assistant\",\"stop_reason\":null,\"stop_sequence\":null,\"type\":\"message\",\"usage\":{\"input_tokens\":3,\"output_tokens\":0}},\"type\":\"message_start\"}",
+                "data": "{\"message\":{\"content\":[],\"id\":\"msg_recorded_0004\",\"model\":\"claude-fixture-model\",\"role\":\"assistant\",\"stop_reason\":null,\"stop_sequence\":null,\"type\":\"message\",\"usage\":{\"cache_creation_input_tokens\":50,\"cache_read_input_tokens\":1000,\"input_tokens\":10,\"output_tokens\":0}},\"type\":\"message_start\"}",
                 "id": null,
                 "retry": null
               },
@@ -344,9 +349,9 @@
             "kind": "json",
             "value": {
               "error": {
-                "code": 502,
+                "code": 429,
                 "message": "synthetic rate limit",
-                "type": "server_error"
+                "type": "rate_limit_error"
               }
             }
           }

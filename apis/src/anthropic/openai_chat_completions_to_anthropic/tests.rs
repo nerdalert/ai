@@ -112,8 +112,42 @@ fn converts_anthropic_json_tools_usage_and_stop_reason() {
         "{\"city\":\"Oslo\"}"
     );
     assert_eq!(translated["choices"][0]["finish_reason"], "tool_calls");
-    assert_eq!(translated["usage"]["total_tokens"], 14);
+    assert_eq!(translated["usage"]["total_tokens"], 16);
     assert_eq!(translated["usage"]["prompt_tokens_details"]["cached_tokens"], 2);
+}
+
+#[test]
+fn includes_cached_input_in_client_visible_usage() {
+    let body = br#"{"type":"message","id":"msg_cached","role":"assistant","content":[],"stop_reason":"end_turn","usage":{"input_tokens":10,"cache_read_input_tokens":1000,"cache_creation_input_tokens":50,"output_tokens":4}}"#;
+    let translated: Value =
+        serde_json::from_slice(&response::translate_response(body, "client-model").unwrap()).unwrap();
+    assert_eq!(translated["usage"]["prompt_tokens"], 1060);
+    assert_eq!(translated["usage"]["completion_tokens"], 4);
+    assert_eq!(translated["usage"]["total_tokens"], 1064);
+    assert_eq!(translated["usage"]["prompt_tokens_details"]["cached_tokens"], 1000);
+}
+
+#[test]
+fn rejects_overflowed_cached_input_usage() {
+    let body = format!(
+        "{{\"type\":\"message\",\"id\":\"msg_overflow\",\"role\":\"assistant\",\"content\":[],\"stop_reason\":\"end_turn\",\"usage\":{{\"input_tokens\":{},\"cache_read_input_tokens\":1,\"output_tokens\":0}}}}",
+        u64::MAX
+    );
+    assert!(
+        response::translate_response(body.as_bytes(), "client-model")
+            .unwrap_err()
+            .contains("overflow")
+    );
+}
+
+#[test]
+fn accepts_zero_cache_counters() {
+    let body = br#"{"type":"message","id":"msg_zero","role":"assistant","content":[],"stop_reason":"end_turn","usage":{"input_tokens":7,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":2}}"#;
+    let translated: Value =
+        serde_json::from_slice(&response::translate_response(body, "client-model").unwrap()).unwrap();
+    assert_eq!(translated["usage"]["prompt_tokens"], 7);
+    assert_eq!(translated["usage"]["total_tokens"], 9);
+    assert_eq!(translated["usage"]["prompt_tokens_details"]["cached_tokens"], 0);
 }
 
 #[test]
@@ -147,6 +181,37 @@ fn maps_anthropic_errors_to_openai_error_envelope() {
     let value: Value = serde_json::from_slice(&error).unwrap();
     assert_eq!(value["error"]["message"], "busy");
     assert_eq!(value["error"]["type"], "server_error");
+}
+
+#[tokio::test]
+async fn preserves_upstream_error_status_across_response_callbacks() {
+    let config: serde_yaml::Value = serde_yaml::from_str("api_translation_enabled: true").unwrap();
+    let filter = OpenaiChatCompletionsToAnthropicFilter::from_config(&config).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+    let mut response = json_response();
+    response.status = StatusCode::TOO_MANY_REQUESTS;
+    let mut ctx = crate::test_utils::make_filter_context(&request);
+    ctx.current_filter_id = Some(7);
+    selected_profile_metadata(&mut ctx);
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    ctx.response_header = Some(&mut response);
+    assert!(matches!(
+        filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    ctx.response_header = None;
+    let mut body = Some(Bytes::from_static(br#"{"type":"error","error":{"message":"busy"}}"#));
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, true).unwrap(),
+        FilterAction::Continue
+    ));
+    let translated: Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(translated["error"]["message"], "busy");
+    assert_eq!(translated["error"]["type"], "rate_limit_error");
+    assert_eq!(translated["error"]["code"], 429);
 }
 
 #[tokio::test]

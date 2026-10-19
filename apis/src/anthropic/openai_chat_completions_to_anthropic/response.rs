@@ -119,17 +119,40 @@ struct UsageCounts {
 
 /// Translate the usage counters representable by Chat Completions.
 fn translate_usage(usage: &Map<String, Value>) -> Result<UsageCounts, String> {
-    let prompt_tokens = positive_or_zero(usage, "input_tokens")?;
+    let prompt_tokens = total_input_tokens(usage)?;
     let completion_tokens = positive_or_zero(usage, "output_tokens")?;
     let total_tokens = prompt_tokens
         .checked_add(completion_tokens)
         .ok_or("Anthropic usage token count overflow")?;
-    let cached_tokens = usage.get("cache_read_input_tokens").and_then(Value::as_u64);
+    let cached_tokens = usage
+        .get("cache_read_input_tokens")
+        .map(|_| optional_usage(usage, "cache_read_input_tokens"))
+        .transpose()?;
     Ok(UsageCounts {
         prompt_tokens,
         completion_tokens,
         total_tokens,
         cached_tokens,
+    })
+}
+
+/// Anthropic reports uncached, cache-read, and cache-created input separately.
+pub(crate) fn total_input_tokens(usage: &Map<String, Value>) -> Result<u64, String> {
+    let input = positive_or_zero(usage, "input_tokens")?;
+    let read = optional_usage(usage, "cache_read_input_tokens")?;
+    let created = optional_usage(usage, "cache_creation_input_tokens")?;
+    input
+        .checked_add(read)
+        .and_then(|sum| sum.checked_add(created))
+        .ok_or_else(|| "Anthropic usage token count overflow".to_owned())
+}
+
+/// Read an optional non-negative Anthropic usage counter, defaulting absence to zero.
+fn optional_usage(usage: &Map<String, Value>, key: &str) -> Result<u64, String> {
+    usage.get(key).map_or(Ok(0), |value| {
+        value
+            .as_u64()
+            .ok_or_else(|| format!("Anthropic usage requires non-negative integer {key}"))
     })
 }
 
