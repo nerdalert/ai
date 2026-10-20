@@ -151,6 +151,16 @@ fn accepts_zero_cache_counters() {
 }
 
 #[test]
+fn accepts_null_cache_counters() {
+    let body = br#"{"type":"message","id":"msg_null","role":"assistant","content":[],"stop_reason":"end_turn","usage":{"input_tokens":7,"cache_read_input_tokens":null,"cache_creation_input_tokens":null,"output_tokens":2}}"#;
+    let translated: Value =
+        serde_json::from_slice(&response::translate_response(body, "client-model").unwrap()).unwrap();
+    assert_eq!(translated["usage"]["prompt_tokens"], 7);
+    assert_eq!(translated["usage"]["total_tokens"], 9);
+    assert!(translated["usage"]["prompt_tokens_details"].is_null());
+}
+
+#[test]
 fn maps_refusal_stop_reason_to_content_filter() {
     let body = br#"{"type":"message","id":"msg_refusal","role":"assistant","model":"claude","content":[{"type":"text","text":"I cannot help with that request."}],"stop_reason":"refusal","usage":{"input_tokens":4,"output_tokens":6}}"#;
     let translated: Value =

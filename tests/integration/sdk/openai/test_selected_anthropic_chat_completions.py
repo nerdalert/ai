@@ -162,13 +162,25 @@ def test_json_and_cached_usage(client: OpenAI) -> None:
          "cache_creation_input_tokens": 50, "output_tokens": 4},
     ))
     response = client.chat.completions.create(model=MODEL, messages=[{"role": "user", "content": "hi"}], max_tokens=16)
-    assert response.choices[0].message.content == "hello"
-    assert response.usage.prompt_tokens == 1060
-    assert response.usage.completion_tokens == 4
-    assert response.usage.total_tokens == 1064
+    assert response.choices[0].message.content == "hello", "Anthropic text must reach the OpenAI message"
+    assert response.usage.prompt_tokens == 1060, "cache tokens must count toward prompt usage"
+    assert response.usage.completion_tokens == 4, "Anthropic output tokens must become completion tokens"
+    assert response.usage.total_tokens == 1064, "total tokens must include cache and output tokens"
     path, upstream = STATE.requests[-1]
-    assert path == "/v1/messages"
-    assert upstream["model"] == "claude-fixture-model"
+    assert path == "/v1/messages", "selected Anthropic requests must use the Messages path"
+    assert upstream["model"] == "claude-fixture-model", "selected target model must reach Anthropic"
+
+
+def test_null_cache_usage(client: OpenAI) -> None:
+    STATE.script(200, "application/json", _message(
+        [{"type": "text", "text": "hello"}],
+        {"input_tokens": 10, "cache_read_input_tokens": None,
+         "cache_creation_input_tokens": None, "output_tokens": 4},
+    ))
+    response = client.chat.completions.create(model=MODEL, messages=[{"role": "user", "content": "hi"}], max_tokens=16)
+    assert response.choices[0].message.content == "hello", "nullable Anthropic usage must not discard translated text"
+    assert response.usage.prompt_tokens == 10, "null cache counters must add no prompt tokens"
+    assert response.usage.total_tokens == 14, "null cache counters must add no total tokens"
 
 
 def test_streaming_and_terminal_usage(client: OpenAI) -> None:
@@ -190,9 +202,9 @@ def test_streaming_and_terminal_usage(client: OpenAI) -> None:
         model=MODEL, messages=[{"role": "user", "content": "hi"}], stream=True,
         stream_options={"include_usage": True}, max_tokens=16,
     ))
-    assert any(chunk.choices and chunk.choices[0].delta.content == "hello" for chunk in chunks)
-    assert chunks[-1].usage.prompt_tokens == 1060
-    assert chunks[-1].usage.total_tokens == 1064
+    assert any(chunk.choices and chunk.choices[0].delta.content == "hello" for chunk in chunks), "Anthropic SSE text must reach OpenAI chunks"
+    assert chunks[-1].usage.prompt_tokens == 1060, "SSE cache tokens must count toward prompt usage"
+    assert chunks[-1].usage.total_tokens == 1064, "SSE total usage must include cache and output tokens"
 
 
 def test_tool_call_and_result_round_trip(client: OpenAI) -> None:
@@ -205,8 +217,8 @@ def test_tool_call_and_result_round_trip(client: OpenAI) -> None:
         model=MODEL, messages=[{"role": "user", "content": "weather?"}], tools=tools, max_tokens=16,
     )
     call = first.choices[0].message.tool_calls[0]
-    assert call.function.name == "weather"
-    assert json.loads(call.function.arguments) == {"city": "Oslo"}
+    assert call.function.name == "weather", "Anthropic tool use must become an OpenAI function call"
+    assert json.loads(call.function.arguments) == {"city": "Oslo"}, "tool arguments must retain the provider input"
     STATE.script(200, "application/json", _message(
         [{"type": "text", "text": "sunny"}], {"input_tokens": 4, "output_tokens": 2},
     ))
@@ -215,8 +227,8 @@ def test_tool_call_and_result_round_trip(client: OpenAI) -> None:
         first.choices[0].message.model_dump(exclude_none=True),
         {"role": "tool", "tool_call_id": call.id, "content": "sunny"},
     ], tools=tools, max_tokens=16)
-    assert second.choices[0].message.content == "sunny"
-    assert STATE.requests[-1][1]["messages"][-1]["content"][0]["type"] == "tool_result"
+    assert second.choices[0].message.content == "sunny", "tool-result round trip must return translated text"
+    assert STATE.requests[-1][1]["messages"][-1]["content"][0]["type"] == "tool_result", "OpenAI tool results must become Anthropic tool_result blocks"
 
 
 @pytest.mark.parametrize("status", [429, 529])
@@ -224,10 +236,10 @@ def test_provider_error_preserves_status(client: OpenAI, status: int) -> None:
     STATE.script(status, "application/json", {"type": "error", "error": {"message": "busy"}})
     with pytest.raises(APIStatusError) as caught:
         client.chat.completions.create(model=MODEL, messages=[{"role": "user", "content": "hi"}], max_tokens=16)
-    assert caught.value.status_code == status
+    assert caught.value.status_code == status, "provider HTTP status must survive translation"
     body = caught.value.response.json()
-    assert body["error"]["code"] == status
-    assert body["error"]["type"] == ("rate_limit_error" if status == 429 else "server_error")
+    assert body["error"]["code"] == status, "OpenAI error code must retain provider status"
+    assert body["error"]["type"] == ("rate_limit_error" if status == 429 else "server_error"), "OpenAI error type must match provider status"
 
 
 if __name__ == "__main__":

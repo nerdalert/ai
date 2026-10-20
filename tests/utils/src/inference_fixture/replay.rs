@@ -770,12 +770,14 @@ fn fixture_overlay_path() -> PathBuf {
         .join(FIXTURE_OVERLAY_RELATIVE_PATH)
 }
 
-/// Replace the fixture-only relative path with its canonical repository path.
+/// Rewrite only the checked-in fixture overlay path, so replay data cannot
+/// select an arbitrary local file.
 fn patch_fixture_overlay_path(source: &str) -> Result<String, FixtureError> {
     patch_overlay_path(source, &fixture_overlay_path())
 }
 
-/// Replace the fixture overlay path only for configs that reference it.
+/// Rewrite only references to the checked-in fixture overlay. Other paths in
+/// replay configs are left untouched rather than opened as local files.
 fn patch_overlay_path(source: &str, overlay_path: &Path) -> Result<String, FixtureError> {
     if !source.contains(FIXTURE_OVERLAY_RELATIVE_PATH) {
         return Ok(source.to_owned());

@@ -18,7 +18,9 @@
       "chatcmpl-msg_context_json": "chatcmpl-recorded-0005",
       "msg_context_json": "msg_recorded_0006",
       "chatcmpl-msg_context_stream": "chatcmpl-recorded-0007",
-      "msg_context_stream": "msg_recorded_0008"
+      "msg_context_stream": "msg_recorded_0008",
+      "chatcmpl-msg_null": "chatcmpl-recorded-0009",
+      "msg_null": "msg_recorded_0010"
     }
   },
   "turns": [
@@ -690,6 +692,129 @@
               }
             ],
             "done": false
+          }
+        }
+      }
+    },
+    {
+      "name": "null-cache-json",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_tokens": 16,
+              "messages": [
+                {
+                  "content": "Say hello with null cache counters.",
+                  "role": "user"
+                }
+              ],
+              "model": "fixture-openai-model",
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "choices": [
+                {
+                  "finish_reason": "stop",
+                  "index": 0,
+                  "message": {
+                    "content": "fixture hello",
+                    "role": "assistant"
+                  }
+                }
+              ],
+              "created": 0,
+              "id": "chatcmpl-recorded-0009",
+              "model": "fixture-openai-model",
+              "object": "chat.completion",
+              "usage": {
+                "completion_tokens": 2,
+                "prompt_tokens": 10,
+                "total_tokens": 12
+              }
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/messages",
+          "headers": {
+            "anthropic-version": [
+              "2023-06-01"
+            ],
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_tokens": 16,
+              "messages": [
+                {
+                  "content": [
+                    {
+                      "text": "Say hello with null cache counters.",
+                      "type": "text"
+                    }
+                  ],
+                  "role": "user"
+                }
+              ],
+              "model": "claude-fixture-model",
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "content": [
+                {
+                  "text": "fixture hello",
+                  "type": "text"
+                }
+              ],
+              "id": "msg_recorded_0010",
+              "model": "claude-fixture-model",
+              "role": "assistant",
+              "stop_reason": "end_turn",
+              "type": "message",
+              "usage": {
+                "input_tokens": 10,
+                "cache_read_input_tokens": null,
+                "cache_creation_input_tokens": null,
+                "output_tokens": 2
+              }
+            }
           }
         }
       }

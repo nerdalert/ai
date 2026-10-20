@@ -126,6 +126,7 @@ fn translate_usage(usage: &Map<String, Value>) -> Result<UsageCounts, String> {
         .ok_or("Anthropic usage token count overflow")?;
     let cached_tokens = usage
         .get("cache_read_input_tokens")
+        .filter(|value| !value.is_null())
         .map(|_| optional_usage(usage, "cache_read_input_tokens"))
         .transpose()?;
     Ok(UsageCounts {
@@ -149,7 +150,7 @@ pub(crate) fn total_input_tokens(usage: &Map<String, Value>) -> Result<u64, Stri
 
 /// Read an optional non-negative Anthropic usage counter, defaulting absence to zero.
 fn optional_usage(usage: &Map<String, Value>, key: &str) -> Result<u64, String> {
-    usage.get(key).map_or(Ok(0), |value| {
+    usage.get(key).filter(|value| !value.is_null()).map_or(Ok(0), |value| {
         value
             .as_u64()
             .ok_or_else(|| format!("Anthropic usage requires non-negative integer {key}"))

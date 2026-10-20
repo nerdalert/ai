@@ -800,3 +800,12 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: external_model.anthropic.response.null_cache_usage
+    scopes:
+      - openai_chat_completions_to_anthropic_messages
+    status: synthetic_only
+    scenarios:
+      - openai_legacy/anthropic-json-sse-error
+    providers:
+      synthetic:
+        status: synthetic_only
